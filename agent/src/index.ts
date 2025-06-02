@@ -19,6 +19,8 @@ import {
     settings,
     stringToUuid,
     validateCharacterConfig,
+    Memory,
+    State,
 } from "@elizaos/core";
 import { defaultCharacter } from "./defaultCharacter.ts";
 
@@ -31,6 +33,14 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import yargs from "yargs";
+import { GetBestSolanaRaydiumPoolApyAction } from "@elizaos/plugin-defillama/src/actions";
+import { createSolanaRpc } from "@solana/kit";
+import { getSplTokenBalance, getSolBalance } from "@elizaos/plugin-solana-v2/src/utils/getTokenBalance";
+import { createJupiterApiClient } from '@jup-ag/api';
+import { swapToken } from "@elizaos/plugin-solana";
+import { Keypair, Connection } from "@solana/web3.js";
+import bs58 from "bs58";
+import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserFarmPosition, getAllUserFarmPositions, getUserLpBalance, poolContainsSol } from '@elizaos/plugin-raydium';
 
 export const wait = (minTime = 1000, maxTime = 3000) => {
     const waitTime =
@@ -769,6 +779,258 @@ async function findDatabaseAdapter(runtime: AgentRuntime) {
     return adapterInterface;
 }
 
+// Helper to fetch and parse the best Raydium-amm pool info from DefiLlama
+async function getBestRaydiumPoolInfo(runtime, rpc): Promise<{ bestPoolId: string | null, bestApy: number | null, parsed: any }> {
+    const action = new GetBestSolanaRaydiumPoolApyAction();
+    const state = {
+        bio: "",
+        lore: "",
+        messageDirections: "",
+        postDirections: "",
+        roomId: runtime.agentId,
+        actors: "",
+        recentMessages: "",
+        recentMessagesData: [],
+    };
+    await action.handler(runtime, {
+        userId: runtime.agentId,
+        agentId: runtime.agentId,
+        roomId: runtime.agentId,
+        content: { text: "What is the best APY on Solana for Raydium-amm with a TVL over 25 million and 7d volume over 1 million?" }
+    }, state);
+    const resultText = (state as any).responseData?.text || "";
+    elizaLogger.info("DefiLlama action response:", resultText);
+    // Extract JSON block
+    let bestPoolId: string | null = null;
+    let parsed: any = null;
+    const jsonMatch = resultText.match(/JSON: (\{.*\})/);
+    if (jsonMatch) {
+        try {
+            parsed = JSON.parse(jsonMatch[1]);
+            elizaLogger.info("Parsed JSON from DefiLlama:", parsed);
+            bestPoolId = parsed.poolId;
+        } catch (e) {
+            elizaLogger.warn("Failed to parse JSON block for poolId:", e);
+        }
+    } else {
+        elizaLogger.warn("No JSON block found in DefiLlama response.");
+    }
+    const apyMatch = resultText.match(/([0-9.]+)%/);
+    const bestApy = apyMatch ? parseFloat(apyMatch[1]) : null;
+    return { bestPoolId, bestApy, parsed };
+}
+
+// Helper to get mints and pool info for a Raydium pool symbol
+async function getBestRaydiumPool(runtime, symbol) {
+    const { mintA, mintB } = await getMintsForSymbol(symbol);
+    elizaLogger.info(`Mint for ${symbol.split('-')[0]}:`, mintA);
+    elizaLogger.info(`Mint for ${symbol.split('-')[1]}:`, mintB);
+    const poolInfo = await findRaydiumPoolByMints(mintA, mintB);
+    elizaLogger.info('Raydium pool info by mints:', poolInfo);
+    return { mintA, mintB, poolInfo };
+}
+
+// --- Yield Optimizer Loop ---
+async function startYieldOptimizerLoop(runtime) {
+    elizaLogger.warn("*** MAINNET MODE: REAL FUNDS AT RISK! ***");
+    const scanIntervalMs = 30 * 60 * 1000; // 30 minutes
+    const jupiter = createJupiterApiClient({ basePath: 'https://quote-api.jup.ag' });
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+    const rpc = createSolanaRpc(settings.SOLANA_RPC_URL!);
+    let currentPoolInfo = null;
+    let currentPoolId = null;
+    let currentApy = 0;
+    const walletPublicKey = settings.SOLANA_PUBLIC_KEY;
+    const walletPrivateKey = settings.SOLANA_PRIVATE_KEY;
+    elizaLogger.info('Using public key for Raydium positions:', walletPublicKey);
+    const APY_IMPROVEMENT_THRESHOLD = 0.5; // percent
+    const MIN_SOL_BALANCE = 0.05; // Keep minimum SOL for fees
+    while (true) {
+        try {
+            // Step 1: Get best Raydium-amm APY from DefiLlama
+            const { bestPoolId, bestApy, parsed } = await getBestRaydiumPoolInfo(runtime, null);
+            elizaLogger.info("Best Raydium-amm pool info:", { bestPoolId, bestApy, parsed });
+            
+            if (!parsed || !parsed.symbol || !bestApy) {
+                elizaLogger.warn("No valid pool found from DefiLlama");
+                await wait(scanIntervalMs, scanIntervalMs + 1000);
+                continue;
+            }
+
+            // Get mints and pool info for the best symbol
+            const { mintA, mintB, poolInfo } = await getBestRaydiumPool(runtime, parsed.symbol);
+            
+            if (!poolInfo || !poolInfo.id) {
+                elizaLogger.error('Could not find Raydium pool for symbol:', parsed.symbol);
+                await wait(scanIntervalMs, scanIntervalMs + 1000);
+                continue;
+            }
+
+            const newPoolId = poolInfo.id;
+            
+            // Check if this pool contains SOL/WSOL
+            const containsSol = await poolContainsSol(rpc.connection, newPoolId);
+            if (!containsSol) {
+                elizaLogger.warn(`Pool ${newPoolId} does not contain SOL/WSOL, skipping`);
+                await wait(scanIntervalMs, scanIntervalMs + 1000);
+                continue;
+            }
+
+            // Step 2: Check if we should switch pools
+            const shouldSwitch = !currentPoolId || 
+                                 currentPoolId !== newPoolId || 
+                                 (bestApy - currentApy) > APY_IMPROVEMENT_THRESHOLD;
+
+            if (!shouldSwitch) {
+                elizaLogger.info(`Current pool ${currentPoolId} is still optimal (APY: ${currentApy}%)`);
+                await wait(scanIntervalMs, scanIntervalMs + 1000);
+                continue;
+            }
+
+            elizaLogger.info(`Switching from pool ${currentPoolId} (APY: ${currentApy}%) to ${newPoolId} (APY: ${bestApy}%)`);
+
+            // Step 3: Check current positions (both unstaked and farmed)
+            const positions = await getUserRaydiumPositions(walletPublicKey, settings.SOLANA_RPC_URL);
+            elizaLogger.info(`Found ${positions.length} unstaked Raydium LP positions`);
+            
+            // Check for farmed positions ONLY for the specific LP tokens we found (FAST METHOD)
+            elizaLogger.info("🔍 Fast farm check for detected LP tokens...");
+            const farmPositions = [];
+            
+            if (positions.length > 0) {
+                // Extract LP token mints from detected positions
+                const lpTokenMints = positions.map(pos => pos.lpMint);
+                elizaLogger.info(`Checking farms for ${lpTokenMints.length} specific LP tokens`);
+                
+                // Check farm positions for each detected LP token specifically (much faster than checking all farms)
+                for (const lpMint of lpTokenMints) {
+                    elizaLogger.info(`🔎 Checking farms for LP token: ${lpMint.substring(0, 8)}...`);
+                    const specificFarmPositions = await getUserFarmPosition(walletPublicKey, lpMint, settings.SOLANA_RPC_URL);
+                    farmPositions.push(...specificFarmPositions);
+                    
+                    if (specificFarmPositions.length > 0) {
+                        elizaLogger.info(`✅ Found ${specificFarmPositions.length} farm positions for this LP token`);
+                    }
+                }
+            } else {
+                elizaLogger.info("No unstaked LP positions found, skipping targeted farm check");
+            }
+            
+            elizaLogger.info(`Found ${farmPositions.length} farmed positions for detected LP tokens`);
+            
+            // Log details of all positions with better formatting
+            elizaLogger.info("=== POSITION SUMMARY ===");
+            
+            let totalValueDescription = [];
+            
+            for (const pos of positions) {
+                const balanceFormatted = (parseInt(pos.balance) / 1e9).toFixed(6); // Assuming 9 decimals
+                elizaLogger.info(`📊 Unstaked LP: Pool ${pos.poolId}`);
+                elizaLogger.info(`   LP Token Balance: ${balanceFormatted} tokens`);
+                elizaLogger.info(`   LP Mint: ${pos.lpMint}`);
+                totalValueDescription.push(`${balanceFormatted} LP tokens (unstaked)`);
+            }
+            
+            for (const farm of farmPositions) {
+                const stakedFormatted = (parseInt(farm.deposited) / 1e9).toFixed(6); // Assuming 9 decimals
+                elizaLogger.info(`🚜 Farmed LP: Farm ${farm.farmId}`);
+                elizaLogger.info(`   Staked Amount: ${stakedFormatted} tokens`);
+                elizaLogger.info(`   LP Mint: ${farm.lpMint}`);
+                totalValueDescription.push(`${stakedFormatted} LP tokens (farmed)`);
+            }
+            
+            const totalPositionCount = positions.length + farmPositions.length;
+            elizaLogger.info(`📈 Total Raydium Positions: ${totalPositionCount}`);
+            elizaLogger.info(`💰 Portfolio: ${totalValueDescription.join(', ')}`);
+            elizaLogger.info("========================");
+
+            // // Step 4: Close existing positions if any
+            // if (positions.length > 0) {
+            //     elizaLogger.info("Closing existing positions...");
+            //     for (const position of positions) {
+            //         try {
+            //             const lpBalance = await getUserLpBalance(rpc.connection, walletPublicKey, position.poolId);
+            //             elizaLogger.info(`Position in pool ${position.poolId}: ${lpBalance.balance} LP tokens`);
+                        
+            //             // TODO: Implement actual position closing
+            //             // This would require implementing the removeLiquidity function properly
+            //             elizaLogger.warn("Position closing not implemented yet - would remove liquidity here");
+            //         } catch (err) {
+            //             elizaLogger.error(`Failed to close position in pool ${position.poolId}:`, err);
+            //         }
+            //     }
+            // }
+
+            // // Step 5: Get wallet balances
+            // const solBalance = await getSolBalance(rpc.connection, walletPublicKey);
+            // elizaLogger.info(`Wallet SOL balance: ${solBalance}`);
+
+            // if (solBalance <= MIN_SOL_BALANCE) {
+            //     elizaLogger.error(`Insufficient SOL balance: ${solBalance}. Need at least ${MIN_SOL_BALANCE}`);
+            //     await wait(scanIntervalMs, scanIntervalMs + 1000);
+            //     continue;
+            // }
+
+            // // Step 6: Calculate amounts for new position
+            // const availableSol = solBalance - MIN_SOL_BALANCE;
+            // const halfSolAmount = availableSol / 2;
+
+            // // Determine which token is SOL and which is the other token
+            // const isMintASol = mintA === SOL_MINT;
+            // const otherTokenMint = isMintASol ? mintB : mintA;
+
+            // elizaLogger.info(`Preparing to add liquidity: ${halfSolAmount} SOL + equivalent ${otherTokenMint}`);
+
+            // // Step 7: Swap half SOL for the other token
+            // try {
+            //     // Get quote for swap
+            //     const quoteResponse = await jupiter.quoteGet({
+            //         inputMint: SOL_MINT,
+            //         outputMint: otherTokenMint,
+            //         amount: Math.floor(halfSolAmount * 1e9), // Convert to lamports
+            //         slippage: 50, // 0.5% slippage
+            //     });
+
+            //     if (!quoteResponse || !quoteResponse.routePlan) {
+            //         throw new Error("Failed to get swap quote");
+            //     }
+
+            //     elizaLogger.info(`Swap quote: ${halfSolAmount} SOL -> ${quoteResponse.outAmount / 1e9} ${otherTokenMint}`);
+
+            //     // TODO: Execute the swap
+            //     elizaLogger.warn("Swap execution not implemented - would swap tokens here");
+                
+            // } catch (err) {
+            //     elizaLogger.error("Failed to swap tokens:", err);
+            //     await wait(scanIntervalMs, scanIntervalMs + 1000);
+            //     continue;
+            // }
+
+            // // Step 8: Add liquidity to the new pool
+            // // TODO: Implement actual liquidity addition
+            // elizaLogger.warn("Liquidity addition not implemented - would stake in pool here");
+
+            // // Update current pool info
+            // currentPoolId = newPoolId;
+            // currentPoolInfo = poolInfo;
+            // currentApy = bestApy;
+
+            // elizaLogger.info(`Successfully switched to pool ${currentPoolId} with APY ${currentApy}%`);
+        } catch (err) {
+            elizaLogger.error("Error in yield optimizer loop:");
+            if (err && err.stack) {
+                elizaLogger.error(err.stack);
+            } else if (typeof err === "object") {
+                elizaLogger.error(JSON.stringify(err, null, 2));
+            } else {
+                elizaLogger.error(String(err));
+            }
+        }
+        await wait(scanIntervalMs, scanIntervalMs + 1000);
+    }
+}
+
 async function startAgent(
     character: Character,
     directClient: DirectClient
@@ -807,6 +1069,11 @@ async function startAgent(
 
         // report to console
         elizaLogger.debug(`Started ${character.name} as ${runtime.agentId}`);
+
+        // Start yield optimizer loop for the relevant agent
+        if (character.name === "Solana Raydium Trader") {
+            startYieldOptimizerLoop(runtime);
+        }
 
         return runtime;
     } catch (error) {

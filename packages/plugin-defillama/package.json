@@ -1,0 +1,19 @@
+{
+  "name": "@elizaos/plugin-defillama",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsup --format esm --dts",
+    "dev": "tsup --format esm --dts --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@elizaos/core": "*",
+    "tsup": "8.3.5"
+  },
+  "devDependencies": {
+    "tsup": "8.3.5"
+  }
+}
