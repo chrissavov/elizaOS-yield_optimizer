@@ -40,7 +40,17 @@ import { createJupiterApiClient } from '@jup-ag/api';
 import { swapToken } from "@elizaos/plugin-solana";
 import { Keypair, Connection } from "@solana/web3.js";
 import bs58 from "bs58";
-import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserFarmPosition, getAllUserFarmPositions, getUserLpBalance, poolContainsSol } from '@elizaos/plugin-raydium';
+import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserLpBalance, poolContainsSol, removeLiquidity } from '@elizaos/plugin-raydium';
+
+// Suppress WebSocket error messages
+const originalConsoleError = console.error;
+console.error = (...args) => {
+    // Filter out WebSocket 404 errors
+    if (args.length > 0 && typeof args[0] === 'string' && args[0].includes('ws error: Unexpected server response: 404')) {
+        return;
+    }
+    originalConsoleError.apply(console, args);
+};
 
 export const wait = (minTime = 1000, maxTime = 3000) => {
     const waitTime =
@@ -870,7 +880,14 @@ async function startYieldOptimizerLoop(runtime) {
             const newPoolId = poolInfo.id;
             
             // Check if this pool contains SOL/WSOL
-            const containsSol = await poolContainsSol(rpc.connection, newPoolId);
+            const connection = new Connection(settings.SOLANA_RPC_URL!, {
+                commitment: 'confirmed',
+                wsEndpoint: undefined, // Disable WebSocket to avoid 404 errors
+                httpHeaders: {
+                    'solana-client': 'eliza-yield-optimizer'
+                }
+            });
+            const containsSol = await poolContainsSol(connection, newPoolId);
             if (!containsSol) {
                 elizaLogger.warn(`Pool ${newPoolId} does not contain SOL/WSOL, skipping`);
                 await wait(scanIntervalMs, scanIntervalMs + 1000);
@@ -890,77 +907,134 @@ async function startYieldOptimizerLoop(runtime) {
 
             elizaLogger.info(`Switching from pool ${currentPoolId} (APY: ${currentApy}%) to ${newPoolId} (APY: ${bestApy}%)`);
 
-            // Step 3: Check current positions (both unstaked and farmed)
-            const positions = await getUserRaydiumPositions(walletPublicKey, settings.SOLANA_RPC_URL);
-            elizaLogger.info(`Found ${positions.length} unstaked Raydium LP positions`);
+            // Step 3: Check current LP positions
+            const positions = await getUserRaydiumPositions(walletPublicKey, settings.SOLANA_RPC_URL, 0);
+            elizaLogger.info(`Found ${positions.length} Raydium LP positions`);
             
-            // Check for farmed positions ONLY for the specific LP tokens we found (FAST METHOD)
-            elizaLogger.info("🔍 Fast farm check for detected LP tokens...");
-            const farmPositions = [];
-            
-            if (positions.length > 0) {
-                // Extract LP token mints from detected positions
-                const lpTokenMints = positions.map(pos => pos.lpMint);
-                elizaLogger.info(`Checking farms for ${lpTokenMints.length} specific LP tokens`);
-                
-                // Check farm positions for each detected LP token specifically (much faster than checking all farms)
-                for (const lpMint of lpTokenMints) {
-                    elizaLogger.info(`🔎 Checking farms for LP token: ${lpMint.substring(0, 8)}...`);
-                    const specificFarmPositions = await getUserFarmPosition(walletPublicKey, lpMint, settings.SOLANA_RPC_URL);
-                    farmPositions.push(...specificFarmPositions);
-                    
-                    if (specificFarmPositions.length > 0) {
-                        elizaLogger.info(`✅ Found ${specificFarmPositions.length} farm positions for this LP token`);
-                    }
-                }
-            } else {
-                elizaLogger.info("No unstaked LP positions found, skipping targeted farm check");
-            }
-            
-            elizaLogger.info(`Found ${farmPositions.length} farmed positions for detected LP tokens`);
-            
-            // Log details of all positions with better formatting
+            // Log details of all positions with proper balance checking
             elizaLogger.info("=== POSITION SUMMARY ===");
             
-            let totalValueDescription = [];
+            let hasAnyPositions = false;
             
             for (const pos of positions) {
-                const balanceFormatted = (parseInt(pos.balance) / 1e9).toFixed(6); // Assuming 9 decimals
-                elizaLogger.info(`📊 Unstaked LP: Pool ${pos.poolId}`);
-                elizaLogger.info(`   LP Token Balance: ${balanceFormatted} tokens`);
-                elizaLogger.info(`   LP Mint: ${pos.lpMint}`);
-                totalValueDescription.push(`${balanceFormatted} LP tokens (unstaked)`);
+                // Get the actual current balance from the blockchain
+                const lpBalance = await getUserLpBalance(connection, walletPublicKey, pos.poolId);
+                const decimals = lpBalance.decimals;
+                const actualBalance = lpBalance.balance;
+                const balanceFormatted = (parseInt(actualBalance) / Math.pow(10, decimals)).toFixed(6);
+                
+                elizaLogger.info(`📊 LP Position: Pool ${pos.poolId}`);
+                elizaLogger.info(`   LP Token: ${pos.lpMint}`);
+                elizaLogger.info(`   Balance: ${balanceFormatted} tokens (raw: ${actualBalance})`);
+                elizaLogger.info(`   Decimals: ${decimals}`);
+                
+                if (parseInt(actualBalance) > 0) {
+                    hasAnyPositions = true;
+                }
             }
             
-            for (const farm of farmPositions) {
-                const stakedFormatted = (parseInt(farm.deposited) / 1e9).toFixed(6); // Assuming 9 decimals
-                elizaLogger.info(`🚜 Farmed LP: Farm ${farm.farmId}`);
-                elizaLogger.info(`   Staked Amount: ${stakedFormatted} tokens`);
-                elizaLogger.info(`   LP Mint: ${farm.lpMint}`);
-                totalValueDescription.push(`${stakedFormatted} LP tokens (farmed)`);
-            }
-            
-            const totalPositionCount = positions.length + farmPositions.length;
-            elizaLogger.info(`📈 Total Raydium Positions: ${totalPositionCount}`);
-            elizaLogger.info(`💰 Portfolio: ${totalValueDescription.join(', ')}`);
+            elizaLogger.info(`📈 Total Raydium Positions: ${positions.length}`);
             elizaLogger.info("========================");
 
-            // // Step 4: Close existing positions if any
-            // if (positions.length > 0) {
-            //     elizaLogger.info("Closing existing positions...");
-            //     for (const position of positions) {
-            //         try {
-            //             const lpBalance = await getUserLpBalance(rpc.connection, walletPublicKey, position.poolId);
-            //             elizaLogger.info(`Position in pool ${position.poolId}: ${lpBalance.balance} LP tokens`);
+            // Step 4: Remove liquidity from all positions
+            if (hasAnyPositions) {
+                elizaLogger.info("🚀 Starting Step 4: Remove liquidity from all positions...");
+                
+                // Create wallet keypair from private key
+                if (!walletPrivateKey) {
+                    elizaLogger.error("SOLANA_PRIVATE_KEY not found in settings!");
+                    throw new Error("Wallet private key required for Step 4 operations");
+                }
+                
+                const walletKeypair = Keypair.fromSecretKey(bs58.decode(walletPrivateKey));
+                elizaLogger.info(`Using wallet: ${walletKeypair.publicKey.toString()}`);
+                
+                // Verify wallet matches expected public key
+                if (walletKeypair.publicKey.toString() !== walletPublicKey) {
+                    elizaLogger.error(`❌ Wallet mismatch! Expected: ${walletPublicKey}, Got: ${walletKeypair.publicKey.toString()}`);
+                    throw new Error("Wallet keypair does not match expected public key");
+                }
+                
+                // Test connection
+                const testConnection = new Connection(settings.SOLANA_RPC_URL!, {
+                    commitment: 'confirmed',
+                    wsEndpoint: undefined, // Disable WebSocket to avoid 404 errors
+                    httpHeaders: {
+                        'solana-client': 'eliza-yield-optimizer'
+                    }
+                });
+                try {
+                    const balance = await testConnection.getBalance(walletKeypair.publicKey);
+                    elizaLogger.info(`✅ Connection test successful. Wallet balance: ${balance / 1e9} SOL`);
+                } catch (connError) {
+                    elizaLogger.error(`❌ Connection test failed:`, connError);
+                    throw new Error("Failed to connect to Solana RPC");
+                }
+                
+                // Remove liquidity from all LP positions
+                elizaLogger.info(`💧 Removing liquidity from ${positions.length} LP positions...`);
+                
+                for (const position of positions) {
+                    try {
+                        // Get current LP balance
+                        elizaLogger.info(`📊 Checking LP balance for pool ${position.poolId}...`);
+                        const lpBalance = await getUserLpBalance(connection, walletPublicKey, position.poolId);
+                        const balanceFormatted = (parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6);
                         
-            //             // TODO: Implement actual position closing
-            //             // This would require implementing the removeLiquidity function properly
-            //             elizaLogger.warn("Position closing not implemented yet - would remove liquidity here");
-            //         } catch (err) {
-            //             elizaLogger.error(`Failed to close position in pool ${position.poolId}:`, err);
-            //         }
-            //     }
-            // }
+                        elizaLogger.info(`💰 LP balance in pool ${position.poolId}: ${balanceFormatted} tokens (raw: ${lpBalance.balance})`);
+                        
+                        if (parseInt(lpBalance.balance) > 0) {
+                            elizaLogger.info(`🚀 Removing ${balanceFormatted} LP tokens from pool ${position.poolId}...`);
+                            
+                            try {
+                                const beforeSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                                elizaLogger.info(`📊 SOL balance before: ${beforeSOL.toFixed(6)} SOL`);
+                                
+                                const txSignature = await removeLiquidity(connection, {
+                                    poolId: position.poolId,
+                                    lpAmountIn: lpBalance.balance,
+                                    walletKeypair: walletKeypair,
+                                    slippage: 1 // 1% slippage
+                                });
+                                
+                                elizaLogger.info(`✅ Successfully removed liquidity!`);
+                                elizaLogger.info(`🔗 Transaction: ${txSignature}`);
+                                elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
+                                elizaLogger.info(`📋 Pool: ${position.poolId}`);
+                                elizaLogger.info(`💧 LP tokens removed: ${balanceFormatted}`);
+                                
+                                // Wait a bit and check new balance
+                                await wait(5000, 7000);
+                                const afterSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                                elizaLogger.info(`📊 SOL balance after: ${afterSOL.toFixed(6)} SOL`);
+                                elizaLogger.info(`💰 SOL gained: ${(afterSOL - beforeSOL).toFixed(6)} SOL`);
+                                
+                                // Wait between transactions
+                                await wait(3000, 5000);
+                                
+                            } catch (removeError: any) {
+                                elizaLogger.error(`❌ Remove liquidity failed for pool ${position.poolId}:`);
+                                elizaLogger.error(`   Error: ${removeError.message}`);
+                                if (removeError.logs) {
+                                    elizaLogger.error(`   Logs:`, removeError.logs);
+                                }
+                            }
+                        } else {
+                            elizaLogger.info(`ℹ️  No LP tokens to remove from pool ${position.poolId}`);
+                        }
+                        
+                    } catch (err: any) {
+                        elizaLogger.error(`❌ Failed to process pool ${position.poolId}:`, err.message);
+                    }
+                }
+                
+                elizaLogger.info("✅ Step 4 completed: All positions liquidated");
+                elizaLogger.info("🏁 Exiting yield optimizer loop after liquidating all positions");
+                break;
+                
+            } else {
+                elizaLogger.info("No positions with balance found to liquidate");
+            }
 
             // // Step 5: Get wallet balances
             // const solBalance = await getSolBalance(rpc.connection, walletPublicKey);

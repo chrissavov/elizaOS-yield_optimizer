@@ -41,6 +41,17 @@ export interface SwapParams {
     slippage?: number; // percentage, default 1%
 }
 
+export interface HarvestFarmParams {
+    farmId: string;
+    walletKeypair: Keypair;
+}
+
+export interface UnstakeFarmParams {
+    farmId: string;
+    amount: string; // amount of LP tokens to unstake
+    walletKeypair: Keypair;
+}
+
 async function initializeRaydiumSdk(connection: Connection): Promise<Raydium> {
     const owner = Keypair.generate(); // Temporary, will be replaced with actual wallet
     
@@ -91,25 +102,203 @@ export async function removeLiquidity(
 ): Promise<string> {
     try {
         elizaLogger.info(`Removing liquidity from pool ${params.poolId}`);
+        elizaLogger.info(`Amount: ${params.lpAmountIn}, Slippage: ${params.slippage}%`);
         
-        const raydium = await initializeRaydiumSdk(connection);
+        // Create a Raydium instance with the actual wallet
+        const raydium = await Raydium.load({
+            connection: connection as any,
+            owner: params.walletKeypair.publicKey,
+            disableLoadToken: false
+        });
 
-        // Fetch pool info
-        const poolInfo = await raydium.api.fetchPoolById({ ids: params.poolId });
-        if (!poolInfo || poolInfo.length === 0) {
+        elizaLogger.info('Raydium instance created successfully');
+
+        // Fetch pool info using the helper method that returns both RPC data and API format
+        elizaLogger.info('Fetching pool info...');
+        const poolInfoResult = await raydium.liquidity.getPoolInfoFromRpc({ poolId: params.poolId });
+        
+        if (!poolInfoResult || !poolInfoResult.poolInfo) {
             throw new Error(`Pool ${params.poolId} not found`);
         }
 
-        const pool = poolInfo[0] as ApiV3PoolInfoStandardItem;
+        const { poolInfo, poolKeys } = poolInfoResult;
         
-        // Check if it's a standard AMM pool
-        if (!('baseReserve' in pool)) {
-            throw new Error('Pool is not a standard AMM pool');
+        elizaLogger.info(`Pool info retrieved:`, {
+            id: poolInfo.id,
+            programId: poolInfo.programId,
+            baseMint: poolInfo.mintA.address,
+            quoteMint: poolInfo.mintB.address,
+            lpMint: poolInfo.lpMint.address
+        });
+        
+        // Calculate slippage - convert from percentage to proper amounts
+        const slippageBps = Math.floor(params.slippage * 100); // Convert percentage to basis points
+        
+        elizaLogger.info('Building remove liquidity transaction...');
+        
+        // Build remove liquidity transaction
+        // For simplicity, we're using 0 for min amounts, but in production you'd calculate based on slippage
+        const removeLiqTx = await raydium.liquidity.removeLiquidity({
+            poolInfo: poolInfo,
+            poolKeys: poolKeys, // Optional but helpful for efficiency
+            lpAmount: new BN(params.lpAmountIn),
+            baseAmountMin: new BN(0), // TODO: Calculate based on slippage
+            quoteAmountMin: new BN(0), // TODO: Calculate based on slippage
+            config: {
+                bypassAssociatedCheck: false,
+                checkCreateATAOwner: false
+            }
+        });
+        
+        if (!removeLiqTx) {
+            throw new Error('Failed to build remove liquidity transaction');
         }
-
-        // For now, we'll throw an error since the SDK v2 API is different
-        // and would require more complex implementation
-        throw new Error('Remove liquidity not yet implemented for Raydium SDK v2. Please implement using Raydium SDK v2 demo as reference.');
+        
+        elizaLogger.info('Executing remove liquidity transaction...');
+        elizaLogger.info(`🔗 Pool: ${params.poolId}`);
+        elizaLogger.info(`💧 LP Amount: ${params.lpAmountIn}`);
+        elizaLogger.info(`📊 Slippage: ${params.slippage}%`);
+        elizaLogger.info(`👤 Wallet: ${params.walletKeypair.publicKey.toString()}`);
+        
+        // Execute transaction using the SDK's built-in method
+        try {
+            // Add longer delay to avoid rate limiting
+            elizaLogger.info('⏳ Waiting 10 seconds to avoid rate limiting...');
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            
+            elizaLogger.info('🚀 Executing remove liquidity transaction via SDK...');
+            
+            // Temporarily suppress console.log to avoid "simulate tx string" output
+            const originalLog = console.log;
+            console.log = () => {};
+            
+            let result: any;
+            try {
+                result = await removeLiqTx.execute();
+            } finally {
+                // Restore console.log
+                console.log = originalLog;
+            }
+            
+            const txId = typeof result === 'string' ? result : result?.txId;
+            
+            elizaLogger.info(`✅ Remove liquidity transaction successful!`);
+            elizaLogger.info(`🔗 Transaction ID: ${txId}`);
+            elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${txId}`);
+            
+            return txId;
+        } catch (execError: any) {
+            // If execute fails, try manual signing and sending
+            elizaLogger.warn(`⚠️  SDK execution failed: ${execError.message}`);
+            
+            if (execError.message?.includes('429') || execError.message?.includes('Too Many Requests')) {
+                elizaLogger.warn('Rate limited, waiting 10 seconds before retry...');
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else if (execError.message?.includes('Blockhash not found')) {
+                elizaLogger.warn('Blockhash expired during SDK execution, will try manual sending with fresh blockhash...');
+            }
+            
+            // Try manual transaction sending as fallback
+            elizaLogger.info('🔄 Falling back to manual transaction sending...');
+            if (removeLiqTx.transaction) {
+                // Get fresh blockhash
+                elizaLogger.info('Fetching fresh blockhash...');
+                let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                
+                const tx = removeLiqTx.transaction as any;
+                tx.recentBlockhash = blockhash;
+                tx.feePayer = params.walletKeypair.publicKey;
+                
+                if (tx.version === 'legacy' || !tx.version) {
+                    tx.sign(params.walletKeypair);
+                } else {
+                    // For versioned transactions
+                    tx.sign([params.walletKeypair]);
+                }
+                
+                // Add retry logic for rate limiting and blockhash issues
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        elizaLogger.info(`📤 Sending transaction (attempt ${4 - retries}/3)...`);
+                        
+                        // Try sending with skipPreflight true to avoid simulation issues
+                        const signature = await connection.sendRawTransaction(
+                            removeLiqTx.transaction.serialize(),
+                            { 
+                                skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
+                                maxRetries: 3
+                            }
+                        );
+                        
+                        elizaLogger.info(`📋 Transaction sent with signature: ${signature}`);
+                        elizaLogger.info(`⏳ Waiting for confirmation...`);
+                        
+                        // Use polling-based confirmation to avoid WebSocket
+                        elizaLogger.info(`⏳ Confirming transaction...`);
+                        
+                        // Poll for transaction status instead of using WebSocket
+                        let confirmed = false;
+                        const maxAttempts = 30;
+                        for (let i = 0; i < maxAttempts; i++) {
+                            try {
+                                const status = await connection.getSignatureStatus(signature);
+                                if (status?.value?.confirmationStatus === 'confirmed' || 
+                                    status?.value?.confirmationStatus === 'finalized') {
+                                    confirmed = true;
+                                    break;
+                                }
+                            } catch (e) {
+                                // Ignore errors during polling
+                            }
+                            
+                            // Wait 1 second between polls
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                        
+                        if (confirmed) {
+                            elizaLogger.info(`✅ Remove liquidity transaction successful!`);
+                        } else {
+                            elizaLogger.warn(`⚠️  Transaction confirmation timeout, but transaction may still be successful`);
+                        }
+                        
+                        elizaLogger.info(`🔗 Transaction ID: ${signature}`);
+                        elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${signature}`);
+                        elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
+                        
+                        return signature;
+                        
+                    } catch (sendError: any) {
+                        elizaLogger.warn(`⚠️  Transaction send attempt ${4 - retries}/3 failed: ${sendError.message}`);
+                        
+                        if (sendError.message?.includes('429') && retries > 1) {
+                            elizaLogger.warn(`Rate limited, waiting before retry...`);
+                            await new Promise(resolve => setTimeout(resolve, 10000));
+                            retries--;
+                        } else if (sendError.message?.includes('Blockhash not found') && retries > 1) {
+                            elizaLogger.warn(`Blockhash expired, getting fresh blockhash and retrying...`);
+                            // Get a fresh blockhash for retry
+                            const freshBlockhash = await connection.getLatestBlockhash('confirmed');
+                            blockhash = freshBlockhash.blockhash;
+                            lastValidBlockHeight = freshBlockhash.lastValidBlockHeight;
+                            
+                            // Update transaction with fresh blockhash
+                            tx.recentBlockhash = blockhash;
+                            if (tx.version === 'legacy' || !tx.version) {
+                                tx.sign(params.walletKeypair);
+                            } else {
+                                tx.sign([params.walletKeypair]);
+                            }
+                            
+                            retries--;
+                        } else {
+                            throw sendError;
+                        }
+                    }
+                }
+            }
+            throw execError;
+        }
 
     } catch (error) {
         elizaLogger.error('Error removing liquidity:', error);
@@ -231,5 +420,276 @@ export async function poolContainsSol(
     } catch (error) {
         elizaLogger.error('Error checking pool for SOL:', error);
         return false;
+    }
+}
+
+export async function harvestFarmRewards(
+    connection: Connection,
+    params: HarvestFarmParams
+): Promise<string> {
+    try {
+        elizaLogger.info(`Attempting to harvest rewards from farm ${params.farmId}`);
+        elizaLogger.info(`Using wallet: ${params.walletKeypair.publicKey.toString()}`);
+        
+        // Create a Raydium instance with the actual wallet
+        const raydium = await Raydium.load({
+            connection: connection as any,
+            owner: params.walletKeypair.publicKey,
+            disableLoadToken: false
+        });
+
+        elizaLogger.info('Raydium instance created successfully');
+        
+        // Fetch farm info from API
+        elizaLogger.info('Fetching farm info...');
+        const farmInfos = await raydium.api.fetchFarmInfoById({ ids: params.farmId });
+        
+        if (!farmInfos || Object.keys(farmInfos).length === 0) {
+            throw new Error(`Farm ${params.farmId} not found`);
+        }
+        
+        const farmInfo = Object.values(farmInfos)[0];
+        elizaLogger.info('Farm info retrieved:', {
+            id: farmInfo.id,
+            lpMint: farmInfo.lpMint.address,
+            programId: farmInfo.programId,
+            rewardCount: farmInfo.rewardInfos?.length || 0
+        });
+        
+        // Harvest rewards by withdrawing 0 LP tokens
+        // This will claim rewards without removing any staked LP
+        elizaLogger.info('Building harvest transaction (withdraw with amount=0)...');
+        
+        const harvestTx = await raydium.farm.withdraw({
+            farmInfo: farmInfo,
+            amount: 0, // Harvest only - don't unstake any LP
+            useSOLBalance: true, // Handle SOL rewards properly
+            associatedOnly: true, // Use associated token accounts
+        });
+        
+        if (!harvestTx) {
+            throw new Error('Failed to build harvest transaction');
+        }
+        
+        elizaLogger.info('Executing harvest transaction...');
+        
+        // Execute transaction using the SDK's built-in method
+        try {
+            const result = await harvestTx.execute();
+            const txId = typeof result === 'string' ? result : result?.txId;
+            elizaLogger.info(`✅ Harvest successful: ${txId}`);
+            return txId;
+        } catch (execError: any) {
+            // If execute fails, try manual signing and sending
+            if (execError.message?.includes('429') || execError.message?.includes('Too Many Requests')) {
+                elizaLogger.warn('Rate limited, waiting before retry...');
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+            
+            // Try manual transaction sending as fallback
+            elizaLogger.info('Trying manual transaction sending...');
+            if (harvestTx.transaction) {
+                // Get fresh blockhash
+                elizaLogger.info('Fetching fresh blockhash...');
+                let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                
+                const tx = harvestTx.transaction as any;
+                tx.recentBlockhash = blockhash;
+                tx.feePayer = params.walletKeypair.publicKey;
+                
+                if (tx.version === 'legacy' || !tx.version) {
+                    tx.sign(params.walletKeypair);
+                } else {
+                    // For versioned transactions
+                    tx.sign([params.walletKeypair]);
+                }
+                
+                // Add retry logic for rate limiting
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        const signature = await connection.sendRawTransaction(
+                            harvestTx.transaction.serialize(),
+                            { 
+                                skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
+                                maxRetries: 3
+                            }
+                        );
+                        
+                        // Poll for confirmation instead of using WebSocket
+                        let confirmed = false;
+                        for (let i = 0; i < 30; i++) {
+                            try {
+                                const status = await connection.getSignatureStatus(signature);
+                                if (status?.value?.confirmationStatus === 'confirmed' || 
+                                    status?.value?.confirmationStatus === 'finalized') {
+                                    confirmed = true;
+                                    break;
+                                }
+                            } catch (e) {
+                                // Ignore errors during polling
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                        
+                        if (confirmed) {
+                            elizaLogger.info(`✅ Harvest successful (manual): ${signature}`);
+                        } else {
+                            elizaLogger.warn(`⚠️  Harvest confirmation timeout, but transaction may be successful`);
+                        }
+                        elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
+                        return signature;
+                    } catch (sendError: any) {
+                        if (sendError.message?.includes('429') && retries > 1) {
+                            elizaLogger.warn(`Rate limited, retry ${4 - retries}/3 after delay...`);
+                            await new Promise(resolve => setTimeout(resolve, 10000));
+                            retries--;
+                        } else {
+                            throw sendError;
+                        }
+                    }
+                }
+            }
+            throw execError;
+        }
+
+    } catch (error) {
+        elizaLogger.error('Error harvesting farm rewards:', error);
+        throw error;
+    }
+}
+
+export async function unstakeFarmLP(
+    connection: Connection,
+    params: UnstakeFarmParams
+): Promise<string> {
+    try {
+        elizaLogger.info(`Attempting to unstake ${params.amount} LP tokens from farm ${params.farmId}`);
+        elizaLogger.info(`Using wallet: ${params.walletKeypair.publicKey.toString()}`);
+        
+        // Create a Raydium instance with the actual wallet
+        const raydium = await Raydium.load({
+            connection: connection as any,
+            owner: params.walletKeypair.publicKey,
+            disableLoadToken: false
+        });
+
+        elizaLogger.info('Raydium instance created successfully');
+        
+        // Fetch farm info from API
+        elizaLogger.info('Fetching farm info...');
+        const farmInfos = await raydium.api.fetchFarmInfoById({ ids: params.farmId });
+        
+        if (!farmInfos || Object.keys(farmInfos).length === 0) {
+            throw new Error(`Farm ${params.farmId} not found`);
+        }
+        
+        const farmInfo = Object.values(farmInfos)[0];
+        elizaLogger.info('Farm info retrieved:', {
+            id: farmInfo.id,
+            lpMint: farmInfo.lpMint.address,
+            programId: farmInfo.programId,
+            rewardCount: farmInfo.rewardInfos?.length || 0
+        });
+        
+        // Unstake LP tokens by withdrawing the specified amount
+        elizaLogger.info(`Building unstake transaction for ${params.amount} LP tokens...`);
+        
+        const unstakeTx = await raydium.farm.withdraw({
+            farmInfo: farmInfo,
+            amount: params.amount, // Amount of LP tokens to unstake
+            useSOLBalance: true, // Handle SOL rewards properly
+            associatedOnly: true, // Use associated token accounts
+        });
+        
+        if (!unstakeTx) {
+            throw new Error('Failed to build unstake transaction');
+        }
+        
+        elizaLogger.info('Executing unstake transaction...');
+        
+        // Execute transaction using the SDK's built-in method
+        try {
+            const result = await unstakeTx.execute();
+            const txId = typeof result === 'string' ? result : result?.txId;
+            elizaLogger.info(`✅ Unstake successful: ${txId}`);
+            return txId;
+        } catch (execError: any) {
+            // If execute fails, try manual signing and sending
+            if (execError.message?.includes('429') || execError.message?.includes('Too Many Requests')) {
+                elizaLogger.warn('Rate limited, waiting before retry...');
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+            
+            // Try manual transaction sending as fallback
+            elizaLogger.info('Trying manual transaction sending...');
+            if (unstakeTx.transaction) {
+                // Get fresh blockhash
+                elizaLogger.info('Fetching fresh blockhash...');
+                let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                
+                const tx = unstakeTx.transaction as any;
+                tx.recentBlockhash = blockhash;
+                tx.feePayer = params.walletKeypair.publicKey;
+                
+                if (tx.version === 'legacy' || !tx.version) {
+                    tx.sign(params.walletKeypair);
+                } else {
+                    // For versioned transactions
+                    tx.sign([params.walletKeypair]);
+                }
+                
+                // Add retry logic for rate limiting
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        const signature = await connection.sendRawTransaction(
+                            unstakeTx.transaction.serialize(),
+                            { 
+                                skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
+                                maxRetries: 3
+                            }
+                        );
+                        
+                        // Poll for confirmation instead of using WebSocket
+                        let confirmed = false;
+                        for (let i = 0; i < 30; i++) {
+                            try {
+                                const status = await connection.getSignatureStatus(signature);
+                                if (status?.value?.confirmationStatus === 'confirmed' || 
+                                    status?.value?.confirmationStatus === 'finalized') {
+                                    confirmed = true;
+                                    break;
+                                }
+                            } catch (e) {
+                                // Ignore errors during polling
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                        
+                        if (confirmed) {
+                            elizaLogger.info(`✅ Unstake successful (manual): ${signature}`);
+                        } else {
+                            elizaLogger.warn(`⚠️  Unstake confirmation timeout, but transaction may be successful`);
+                        }
+                        elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
+                        return signature;
+                    } catch (sendError: any) {
+                        if (sendError.message?.includes('429') && retries > 1) {
+                            elizaLogger.warn(`Rate limited, retry ${4 - retries}/3 after delay...`);
+                            await new Promise(resolve => setTimeout(resolve, 10000));
+                            retries--;
+                        } else {
+                            throw sendError;
+                        }
+                    }
+                }
+            }
+            throw execError;
+        }
+
+    } catch (error) {
+        elizaLogger.error('Error unstaking farm LP tokens:', error);
+        throw error;
     }
 }
