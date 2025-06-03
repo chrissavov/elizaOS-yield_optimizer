@@ -1143,13 +1143,108 @@ async function startYieldOptimizerLoop(runtime) {
                 elizaLogger.info(`💰 Final SOL balance: ${finalSolBalance.toFixed(6)} SOL`);
             }
             
+            // Step 6: Swap half SOL for the other token
+            if (walletKeypair && mintA && mintB) {
+                elizaLogger.info("🚀 Starting Step 6: Swap half SOL for pool token...");
+                
+                try {
+                    // Determine which mint is NOT SOL
+                    const otherTokenMint = mintA === SOL_MINT ? mintB : mintA;
+                    elizaLogger.info(`Pool tokens: ${mintA} and ${mintB}`);
+                    elizaLogger.info(`Other token mint: ${otherTokenMint}`);
+                    
+                    // Get current SOL balance
+                    const currentSolBalance = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                    elizaLogger.info(`Current SOL balance: ${currentSolBalance.toFixed(6)} SOL`);
+                    
+                    // Calculate amount to swap (half of balance minus MIN_SOL_BALANCE)
+                    const availableForSwap = currentSolBalance - MIN_SOL_BALANCE;
+                    if (availableForSwap <= 0) {
+                        elizaLogger.warn(`Insufficient SOL balance for swap. Have ${currentSolBalance} SOL, need at least ${MIN_SOL_BALANCE} SOL for fees`);
+                    } else {
+                        const amountToSwap = availableForSwap / 2; // Half of available balance
+                        const amountToSwapLamports = Math.floor(amountToSwap * 1e9).toString();
+                        
+                        elizaLogger.info(`💱 Swapping ${amountToSwap.toFixed(6)} SOL to ${otherTokenMint}...`);
+                        elizaLogger.info(`   Keeping ${MIN_SOL_BALANCE} SOL for fees`);
+                        elizaLogger.info(`   Remaining SOL after swap: ~${(currentSolBalance - amountToSwap).toFixed(6)} SOL`);
+                        
+                        try {
+                            // Get quote from Jupiter
+                            const quoteResponse = await fetch(
+                                `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${otherTokenMint}&amount=${amountToSwapLamports}&slippageBps=50`
+                            );
+                            const quoteData = await quoteResponse.json();
+                            
+                            if (!quoteData || quoteData.error) {
+                                throw new Error(`Failed to get quote: ${quoteData?.error || 'Unknown error'}`);
+                            }
+                            
+                            const expectedOutput = quoteData.outAmount ? (parseInt(quoteData.outAmount) / Math.pow(10, poolInfo.mintADecimals || 9)).toFixed(6) : '0';
+                            elizaLogger.info(`Expected output: ${expectedOutput} tokens`);
+                            
+                            // Get swap transaction
+                            const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    quoteResponse: quoteData,
+                                    userPublicKey: walletKeypair.publicKey.toBase58(),
+                                    dynamicComputeUnitLimit: true,
+                                    prioritizationFeeLamports: 1000000
+                                })
+                            });
+                            
+                            const swapData = await swapResponse.json();
+                            
+                            if (!swapData || !swapData.swapTransaction) {
+                                throw new Error(`Failed to get swap transaction: ${swapData?.error || 'Unknown error'}`);
+                            }
+                            
+                            // Execute swap
+                            const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
+                            const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+                            transaction.sign([walletKeypair]);
+                            
+                            const signature = await connection.sendTransaction(transaction, {
+                                maxRetries: 3,
+                                skipPreflight: false
+                            });
+                            
+                            // Wait for confirmation
+                            const latestBlockhash = await connection.getLatestBlockhash();
+                            await connection.confirmTransaction({
+                                signature,
+                                blockhash: latestBlockhash.blockhash,
+                                lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+                            }, 'confirmed');
+                            
+                            elizaLogger.info(`✅ Swap successful!`);
+                            elizaLogger.info(`🔗 Transaction: ${signature}`);
+                            elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${signature}`);
+                            
+                            // Check final balances
+                            await wait(3000, 5000);
+                            const finalSolBalance = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                            elizaLogger.info(`📊 Final SOL balance: ${finalSolBalance.toFixed(6)} SOL`);
+                            
+                        } catch (swapError: any) {
+                            elizaLogger.error(`❌ Failed to swap SOL to ${otherTokenMint}:`, swapError.message);
+                        }
+                    }
+                    
+                    elizaLogger.info("✅ Step 6 completed: Swapped half SOL for pool token");
+                    
+                } catch (error: any) {
+                    elizaLogger.error("❌ Error in Step 6:", error.message);
+                }
+            }
+            
             // Exit the loop after completing all steps
-            elizaLogger.info("🏁 Yield optimizer completed: All positions liquidated and tokens consolidated to SOL");
+            elizaLogger.info("🏁 Yield optimizer completed: All positions liquidated, tokens consolidated, and ready for liquidity provision");
             elizaLogger.info("💡 Ready for next yield optimization cycle");
             break;
             
-            // // Step 6: Swap half SOL for the other token
-
             // // Step 7: Add liquidity to the new pool
         } catch (err) {
             elizaLogger.error("Error in yield optimizer loop:");
