@@ -8,6 +8,8 @@ interface YieldProviderOptions {
 }
 
 export class YieldProvider implements Provider {
+  name = "YieldProvider";
+
   private filterPools(pools: any[], options: YieldProviderOptions): any[] {
     let filtered = pools;
     if (options.stablecoinOnly) {
@@ -24,7 +26,9 @@ export class YieldProvider implements Provider {
     return filtered;
   }
 
-  async get(runtime: IAgentRuntime, message: Memory, state?: State, options: YieldProviderOptions = {}): Promise<string> {
+  async get(runtime: IAgentRuntime, message: Memory, state?: State): Promise<{ text: string; data?: any; values?: Record<string, string> }> {
+    // Extract options from state if present, or use defaults
+    const options: YieldProviderOptions = (state?.yieldOptions as YieldProviderOptions) || {};
     const response = await fetch("https://yields.llama.fi/pools");
     const data = await response.json();
     const filtered = this.filterPools(data.data, options);
@@ -32,7 +36,7 @@ export class YieldProvider implements Provider {
     const formatted = filtered.slice(0, limit).map((pool: any, i: number) => {
       return `${i + 1}. ${pool.project} on ${pool.chain} (${pool.symbol}): ${pool.apy?.toFixed(2) ?? "?"}% APY, TVL: $${Math.round(pool.tvlUsd).toLocaleString()}`;
     }).join("\n");
-    return formatted || "No yield opportunities found at this time.";
+    return { text: formatted || "No yield opportunities found at this time.", data: filtered, values: {} };
   }
 
   async getRaw(runtime: IAgentRuntime, message: Memory, state?: State, options: YieldProviderOptions = {}): Promise<any[]> {

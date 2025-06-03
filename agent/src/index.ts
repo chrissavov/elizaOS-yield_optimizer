@@ -1036,61 +1036,11 @@ async function startYieldOptimizerLoop(runtime) {
                 elizaLogger.info("No positions with balance found to liquidate");
             }
 
-            // // Step 5: Get wallet balances
-            // const solBalance = await getSolBalance(rpc.connection, walletPublicKey);
-            // elizaLogger.info(`Wallet SOL balance: ${solBalance}`);
+            // // Step 5: Get wallet balances and swap all non SOL tokens for SOL
+            
+            // // Step 6: Swap half SOL for the other token
 
-            // if (solBalance <= MIN_SOL_BALANCE) {
-            //     elizaLogger.error(`Insufficient SOL balance: ${solBalance}. Need at least ${MIN_SOL_BALANCE}`);
-            //     await wait(scanIntervalMs, scanIntervalMs + 1000);
-            //     continue;
-            // }
-
-            // // Step 6: Calculate amounts for new position
-            // const availableSol = solBalance - MIN_SOL_BALANCE;
-            // const halfSolAmount = availableSol / 2;
-
-            // // Determine which token is SOL and which is the other token
-            // const isMintASol = mintA === SOL_MINT;
-            // const otherTokenMint = isMintASol ? mintB : mintA;
-
-            // elizaLogger.info(`Preparing to add liquidity: ${halfSolAmount} SOL + equivalent ${otherTokenMint}`);
-
-            // // Step 7: Swap half SOL for the other token
-            // try {
-            //     // Get quote for swap
-            //     const quoteResponse = await jupiter.quoteGet({
-            //         inputMint: SOL_MINT,
-            //         outputMint: otherTokenMint,
-            //         amount: Math.floor(halfSolAmount * 1e9), // Convert to lamports
-            //         slippage: 50, // 0.5% slippage
-            //     });
-
-            //     if (!quoteResponse || !quoteResponse.routePlan) {
-            //         throw new Error("Failed to get swap quote");
-            //     }
-
-            //     elizaLogger.info(`Swap quote: ${halfSolAmount} SOL -> ${quoteResponse.outAmount / 1e9} ${otherTokenMint}`);
-
-            //     // TODO: Execute the swap
-            //     elizaLogger.warn("Swap execution not implemented - would swap tokens here");
-                
-            // } catch (err) {
-            //     elizaLogger.error("Failed to swap tokens:", err);
-            //     await wait(scanIntervalMs, scanIntervalMs + 1000);
-            //     continue;
-            // }
-
-            // // Step 8: Add liquidity to the new pool
-            // // TODO: Implement actual liquidity addition
-            // elizaLogger.warn("Liquidity addition not implemented - would stake in pool here");
-
-            // // Update current pool info
-            // currentPoolId = newPoolId;
-            // currentPoolInfo = poolInfo;
-            // currentApy = bestApy;
-
-            // elizaLogger.info(`Successfully switched to pool ${currentPoolId} with APY ${currentApy}%`);
+            // // Step 7: Add liquidity to the new pool
         } catch (err) {
             elizaLogger.error("Error in yield optimizer loop:");
             if (err && err.stack) {

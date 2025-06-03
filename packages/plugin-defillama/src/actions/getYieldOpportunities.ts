@@ -50,30 +50,36 @@ export class GetStablecoinYieldOpportunitiesAction implements Action {
   examples = [
     [
       {
+        name: "User asks for best stablecoin APY",
         user: "{{user}}",
         content: { text: "Show me the best stablecoin APY" }
       },
       {
+        name: "System responds with stablecoin yield opportunities",
         user: "{{system}}",
         content: { text: "Here are the top 10 stablecoin yield opportunities: ...", action: "GET_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks for highest DeFi yields for stablecoins",
         user: "{{user}}",
         content: { text: "List the highest DeFi yields for stablecoins" }
       },
       {
+        name: "System lists highest DeFi yields for stablecoins",
         user: "{{system}}",
         content: { text: "Listing the highest DeFi yields for stablecoins: ...", action: "GET_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks for stablecoin yield opportunities only",
         user: "{{user}}",
         content: { text: "Can you get the yield opportunities for stablecoins only?" }
       },
       {
+        name: "System responds with stablecoin yield opportunities only",
         user: "{{system}}",
         content: { text: "Here are the top 10 stablecoin yield opportunities: ...", action: "GET_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
@@ -108,30 +114,36 @@ export class GetYieldOpportunitiesAction implements Action {
   examples = [
     [
       {
+        name: "User asks for best DeFi APY",
         user: "{{user}}",
         content: { text: "Show me the best DeFi APY" }
       },
       {
+        name: "System responds with overall yield opportunities",
         user: "{{system}}",
         content: { text: "Here are the top 10 overall yield opportunities: ...", action: "GET_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks for highest DeFi yields",
         user: "{{user}}",
         content: { text: "List the highest DeFi yields" }
       },
       {
+        name: "System lists highest DeFi yields",
         user: "{{system}}",
         content: { text: "Listing the highest DeFi yields: ...", action: "GET_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks for all yield opportunities",
         user: "{{user}}",
         content: { text: "Can you get yield opportunities for all?" }
       },
       {
+        name: "System responds with all yield opportunities",
         user: "{{system}}",
         content: { text: "Here are the top 10 overall yield opportunities: ...", action: "GET_YIELD_OPPORTUNITIES" }
       }
@@ -166,30 +178,36 @@ export class GetSolanaStablecoinYieldsAction implements Action {
   examples = [
     [
       {
+        name: "User asks for best stablecoin APYs on Solana",
         user: "{{user}}",
         content: { text: "Show me the best stablecoin APYs on Solana" }
       },
       {
+        name: "System responds with Solana stablecoin yield opportunities",
         user: "{{system}}",
         content: { text: "Here are the top 25 stablecoin yield opportunities on Solana: ...", action: "GET_SOLANA_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks to list Solana stablecoin yields",
         user: "{{user}}",
         content: { text: "List Solana stablecoin yields" }
       },
       {
+        name: "System lists Solana stablecoin yields",
         user: "{{system}}",
         content: { text: "Listing the top 25 Solana stablecoin yields: ...", action: "GET_SOLANA_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
     ],
     [
       {
+        name: "User asks for Solana stablecoin pools with best APY",
         user: "{{user}}",
         content: { text: "Solana stablecoin pools with the best APY" }
       },
       {
+        name: "System responds with Solana stablecoin pools by APY",
         user: "{{system}}",
         content: { text: "Here are the top 25 Solana stablecoin pools by APY: ...", action: "GET_SOLANA_STABLECOIN_YIELD_OPPORTUNITIES" }
       }
@@ -251,11 +269,15 @@ export class GetBestSolanaRaydiumPoolApyAction implements Action {
   examples = [
     [
       {
+        name: "User asks for best APY on Solana for Raydium-amm",
         user: "{{user}}",
         content: { "text": "What is the best APY on Solana for Raydium-amm?" }
       },
       {
-        user: "SolanaBestApyFinder", "content": { "text": "The best APY on Solana (Raydium-amm) is ...\nMinimum TVL: $25,000,000, Minimum 7d Volume: $1,000,000", "action": "GET_BEST_SOLANA_RAYDIUM_POOL_APY" } }
+        name: "System responds with best Raydium-amm APY on Solana",
+        user: "SolanaBestApyFinder",
+        content: { "text": "The best APY on Solana (Raydium-amm) is ...\nMinimum TVL: $25,000,000, Minimum 7d Volume: $1,000,000", "action": "GET_BEST_SOLANA_RAYDIUM_POOL_APY" }
+      }
     ]
   ];
 
