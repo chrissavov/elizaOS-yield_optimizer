@@ -38,9 +38,12 @@ import { createSolanaRpc } from "@solana/kit";
 import { getSplTokenBalance, getSolBalance } from "@elizaos/plugin-solana-v2/src/utils/getTokenBalance";
 import { createJupiterApiClient } from '@jup-ag/api';
 import { swapToken } from "@elizaos/plugin-solana";
-import { Keypair, Connection } from "@solana/web3.js";
+import { Keypair, Connection, VersionedTransaction, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserLpBalance, poolContainsSol, removeLiquidity } from '@elizaos/plugin-raydium';
+
+// SPL Token Program ID
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
 // Suppress WebSocket error messages
 const originalConsoleError = console.error;
@@ -936,17 +939,15 @@ async function startYieldOptimizerLoop(runtime) {
             elizaLogger.info(`📈 Total Raydium Positions: ${positions.length}`);
             elizaLogger.info("========================");
 
-            // Step 4: Remove liquidity from all positions
-            if (hasAnyPositions) {
-                elizaLogger.info("🚀 Starting Step 4: Remove liquidity from all positions...");
-                
-                // Create wallet keypair from private key
+            // Create wallet keypair from private key (needed for Step 4 and Step 5)
+            let walletKeypair: Keypair | null = null;
+            if (hasAnyPositions || true) { // Always create keypair if we have positions or need to swap
                 if (!walletPrivateKey) {
                     elizaLogger.error("SOLANA_PRIVATE_KEY not found in settings!");
-                    throw new Error("Wallet private key required for Step 4 operations");
+                    throw new Error("Wallet private key required for operations");
                 }
                 
-                const walletKeypair = Keypair.fromSecretKey(bs58.decode(walletPrivateKey));
+                walletKeypair = Keypair.fromSecretKey(bs58.decode(walletPrivateKey));
                 elizaLogger.info(`Using wallet: ${walletKeypair.publicKey.toString()}`);
                 
                 // Verify wallet matches expected public key
@@ -954,6 +955,11 @@ async function startYieldOptimizerLoop(runtime) {
                     elizaLogger.error(`❌ Wallet mismatch! Expected: ${walletPublicKey}, Got: ${walletKeypair.publicKey.toString()}`);
                     throw new Error("Wallet keypair does not match expected public key");
                 }
+            }
+
+            // Step 4: Remove liquidity from all positions
+            if (hasAnyPositions && walletKeypair) {
+                elizaLogger.info("🚀 Starting Step 4: Remove liquidity from all positions...");
                 
                 // Test connection
                 const testConnection = new Connection(settings.SOLANA_RPC_URL!, {
@@ -1029,14 +1035,118 @@ async function startYieldOptimizerLoop(runtime) {
                 }
                 
                 elizaLogger.info("✅ Step 4 completed: All positions liquidated");
-                elizaLogger.info("🏁 Exiting yield optimizer loop after liquidating all positions");
-                break;
                 
             } else {
                 elizaLogger.info("No positions with balance found to liquidate");
             }
 
-            // // Step 5: Get wallet balances and swap all non SOL tokens for SOL
+            // Step 5: Get wallet balances and swap all non SOL tokens for SOL
+            if (walletKeypair) {
+                elizaLogger.info("🚀 Starting Step 5: Consolidate all tokens to SOL...");
+                
+                // Get all token accounts
+                const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+                    walletKeypair.publicKey,
+                    { programId: TOKEN_PROGRAM_ID }
+                );
+                
+                elizaLogger.info(`Found ${tokenAccounts.value.length} token accounts`);
+                
+                // Filter out SOL and empty accounts
+                const nonSolTokens = tokenAccounts.value.filter(account => {
+                    const tokenInfo = account.account.data.parsed.info;
+                    const balance = tokenInfo.tokenAmount.uiAmount;
+                    return balance > 0 && tokenInfo.mint !== SOL_MINT;
+                });
+                
+                elizaLogger.info(`Found ${nonSolTokens.length} non-SOL tokens to swap`);
+                
+                // Swap each token to SOL
+                for (const tokenAccount of nonSolTokens) {
+                    const tokenInfo = tokenAccount.account.data.parsed.info;
+                    const mint = tokenInfo.mint;
+                    const balance = tokenInfo.tokenAmount.amount;
+                    const uiBalance = tokenInfo.tokenAmount.uiAmount;
+                    
+                    elizaLogger.info(`💱 Swapping ${uiBalance} of token ${mint} to SOL...`);
+                    
+                    try {
+                        // Get quote from Jupiter
+                        const quoteResponse = await fetch(
+                            `https://quote-api.jup.ag/v6/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${balance}&slippageBps=50`
+                        );
+                        const quoteData = await quoteResponse.json();
+                        
+                        if (!quoteData || quoteData.error) {
+                            elizaLogger.warn(`❌ Failed to get quote for ${mint}: ${quoteData?.error || 'Unknown error'}`);
+                            continue;
+                        }
+                        
+                        // Get swap transaction
+                        const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                quoteResponse: quoteData,
+                                userPublicKey: walletKeypair.publicKey.toBase58(),
+                                dynamicComputeUnitLimit: true,
+                                prioritizationFeeLamports: 1000000
+                            })
+                        });
+                        
+                        const swapData = await swapResponse.json();
+                        
+                        if (!swapData || !swapData.swapTransaction) {
+                            elizaLogger.warn(`❌ Failed to get swap transaction for ${mint}`);
+                            continue;
+                        }
+                        
+                        // Execute swap
+                        const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
+                        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+                        transaction.sign([walletKeypair]);
+                        
+                        const beforeSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                        const signature = await connection.sendTransaction(transaction, {
+                            maxRetries: 3,
+                            skipPreflight: false
+                        });
+                        
+                        // Wait for confirmation
+                        const latestBlockhash = await connection.getLatestBlockhash();
+                        await connection.confirmTransaction({
+                            signature,
+                            blockhash: latestBlockhash.blockhash,
+                            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+                        }, 'confirmed');
+                        
+                        const afterSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                        const outputSol = quoteData.outAmount ? parseFloat(quoteData.outAmount) / 1e9 : 0;
+                        
+                        elizaLogger.info(`✅ Swap successful!`);
+                        elizaLogger.info(`🔗 Transaction: ${signature}`);
+                        elizaLogger.info(`💰 Received: ${outputSol.toFixed(6)} SOL`);
+                        elizaLogger.info(`📊 SOL balance: ${beforeSOL.toFixed(6)} → ${afterSOL.toFixed(6)}`);
+                        
+                        // Wait between swaps
+                        await wait(2000, 3000);
+                        
+                    } catch (swapError: any) {
+                        elizaLogger.error(`❌ Failed to swap ${mint} to SOL:`, swapError.message);
+                    }
+                }
+                
+                elizaLogger.info("✅ Step 5 completed: All tokens consolidated to SOL");
+                
+                // Get final SOL balance
+                const finalSolBalance = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                elizaLogger.info(`💰 Final SOL balance: ${finalSolBalance.toFixed(6)} SOL`);
+            }
+            
+            // Exit the loop after completing all steps
+            elizaLogger.info("🏁 Yield optimizer completed: All positions liquidated and tokens consolidated to SOL");
+            elizaLogger.info("💡 Ready for next yield optimization cycle");
+            break;
             
             // // Step 6: Swap half SOL for the other token
 
