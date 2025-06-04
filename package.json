@@ -106,6 +106,7 @@
     "@injectivelabs/sdk-ts": "^1.14.33",
     "@vitest/eslint-plugin": "1.0.1",
     "amqplib": "0.10.5",
+    "bn.js": "^5.2.1",
     "bs58": "4.0.1",
     "csv-parse": "5.6.0",
     "langdetect": "^0.2.1",

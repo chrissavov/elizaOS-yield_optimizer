@@ -1239,114 +1239,115 @@ async function startYieldOptimizerLoop(runtime) {
                     elizaLogger.error("❌ Error in Step 6:", error.message);
                 }
             }
-            /*
+            
             // Step 7: Add liquidity to the new pool
-            if (walletKeypair && mintA && mintB && newPoolId) {
+            if (walletKeypair && poolInfo && mintA && mintB) {
                 elizaLogger.info("🚀 Starting Step 7: Add liquidity to the new pool...");
                 
                 try {
-                    // Determine which mint is SOL and which is the other token
-                    const solMint = mintA === SOL_MINT ? mintA : mintB;
-                    const otherTokenMint = mintA === SOL_MINT ? mintB : mintA;
-                    
-                    elizaLogger.info(`Adding liquidity to pool: ${newPoolId}`);
-                    elizaLogger.info(`SOL mint: ${solMint}`);
-                    elizaLogger.info(`Other token mint: ${otherTokenMint}`);
-                    
-                    // Get current balances
+                    // Get current token balances
                     const solBalance = await connection.getBalance(walletKeypair.publicKey) / 1e9;
+                    elizaLogger.info(`💰 Current SOL balance: ${solBalance.toFixed(6)} SOL`);
                     
-                    // Get token accounts to find the other token balance
+                    // Get all token accounts to find the other token balance
                     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
                         walletKeypair.publicKey,
                         { programId: TOKEN_PROGRAM_ID }
                     );
                     
-                    let otherTokenBalance = '0';
-                    let otherTokenDecimals = 9;
+                    // Find the non-SOL token balance
+                    const otherTokenMint = mintA === SOL_MINT ? mintB : mintA;
+                    const otherTokenAccount = tokenAccounts.value.find(account => 
+                        account.account.data.parsed.info.mint === otherTokenMint
+                    );
                     
-                    for (const account of tokenAccounts.value) {
-                        const tokenInfo = account.account.data.parsed.info;
-                        if (tokenInfo.mint === otherTokenMint) {
-                            otherTokenBalance = tokenInfo.tokenAmount.amount;
-                            otherTokenDecimals = tokenInfo.tokenAmount.decimals;
-                            break;
-                        }
-                    }
-                    
-                    if (otherTokenBalance === '0') {
-                        elizaLogger.warn(`No balance found for other token ${otherTokenMint}`);
-                        elizaLogger.info("✅ Step 7 skipped: No other token balance to add liquidity");
+                    if (!otherTokenAccount) {
+                        elizaLogger.warn(`❌ No balance found for token ${otherTokenMint}`);
+                        elizaLogger.warn(`💡 You need to have both tokens to add liquidity`);
                     } else {
-                        const otherTokenUIAmount = parseInt(otherTokenBalance) / Math.pow(10, otherTokenDecimals);
-                        elizaLogger.info(`Current balances:`);
-                        elizaLogger.info(`  SOL: ${solBalance.toFixed(6)}`);
-                        elizaLogger.info(`  Other token: ${otherTokenUIAmount.toFixed(6)}`);
+                        const otherTokenInfo = otherTokenAccount.account.data.parsed.info;
+                        const otherTokenBalance = otherTokenInfo.tokenAmount.amount;
+                        const otherTokenUiBalance = otherTokenInfo.tokenAmount.uiAmount;
+                        const otherTokenDecimals = otherTokenInfo.tokenAmount.decimals;
                         
-                        // Calculate SOL amount needed for equivalent USD value
-                        // For simplicity, we'll use all available other token and calculate proportional SOL
-                        const availableSol = solBalance - MIN_SOL_BALANCE;
+                        elizaLogger.info(`💰 Other token balance: ${otherTokenUiBalance} (${otherTokenBalance} raw)`);
                         
-                        if (availableSol <= 0) {
-                            elizaLogger.warn(`Insufficient SOL for liquidity provision. Available: ${availableSol.toFixed(6)} SOL`);
+                        // Determine which token is base (A) and which is quote (B)
+                        // In Raydium, token A is usually the non-SOL token, and token B is SOL/WSOL
+                        let baseAmount: string;
+                        let quoteAmount: string;
+                        let fixedSide: 'base' | 'quote';
+                        
+                        if (mintA === SOL_MINT) {
+                            // SOL is token A (base), other token is B (quote)
+                            // Use most of SOL balance, keeping MIN_SOL_BALANCE for fees
+                            const solToUse = Math.max(0, solBalance - MIN_SOL_BALANCE);
+                            baseAmount = Math.floor(solToUse * 1e9).toString(); // Convert to lamports
+                            quoteAmount = otherTokenBalance; // Use all other token balance
+                            fixedSide = 'quote'; // Fix the other token amount
+                            elizaLogger.info(`📊 Using ${solToUse.toFixed(6)} SOL as base token`);
                         } else {
-                            // Use all available other token and calculate equivalent SOL amount
-                            // This is a simplified approach - in production you'd want to check pool ratios
-                            const solAmountToUse = Math.min(availableSol * 0.9, availableSol); // Use 90% of available SOL
-                            const solAmountLamports = Math.floor(solAmountToUse * 1e9).toString();
+                            // Other token is A (base), SOL is B (quote)
+                            baseAmount = otherTokenBalance; // Use all other token balance
+                            const solToUse = Math.max(0, solBalance - MIN_SOL_BALANCE);
+                            quoteAmount = Math.floor(solToUse * 1e9).toString(); // Convert to lamports
+                            fixedSide = 'base'; // Fix the other token amount
+                            elizaLogger.info(`📊 Using ${otherTokenUiBalance} ${parsed.symbol.split('-')[0]} as base token`);
+                        }
+                        
+                        if (parseInt(baseAmount) > 0 && parseInt(quoteAmount) > 0) {
+                            elizaLogger.info(`💧 Adding liquidity to pool ${poolInfo.id}`);
+                            elizaLogger.info(`   Base amount: ${baseAmount}`);
+                            elizaLogger.info(`   Quote amount: ${quoteAmount}`);
+                            elizaLogger.info(`   Fixed side: ${fixedSide}`);
+                            elizaLogger.info(`   Pool symbol: ${parsed.symbol}`);
                             
-                            elizaLogger.info(`💰 Adding liquidity:`);
-                            elizaLogger.info(`  SOL amount: ${solAmountToUse.toFixed(6)} SOL (${solAmountLamports} lamports)`);
-                            elizaLogger.info(`  Other token amount: ${otherTokenUIAmount.toFixed(6)} (${otherTokenBalance} raw)`);
-                            
-                            // Determine base and quote amounts based on pool configuration
-                            let baseAmountIn, quoteAmountIn;
-                            if (mintA === SOL_MINT) {
-                                // SOL is mintA (base)
-                                baseAmountIn = solAmountLamports;
-                                quoteAmountIn = otherTokenBalance;
-                            } else {
-                                // SOL is mintB (quote)  
-                                baseAmountIn = otherTokenBalance;
-                                quoteAmountIn = solAmountLamports;
-                            }
-                            
-                            elizaLogger.info(`Base amount: ${baseAmountIn}, Quote amount: ${quoteAmountIn}`);
-                            
-                            // Add liquidity using the Raydium function
-                            const txSignature = await addLiquidity(connection, {
-                                poolId: newPoolId,
-                                baseAmountIn: baseAmountIn,
-                                quoteAmountIn: quoteAmountIn,
-                                walletKeypair: walletKeypair,
-                                slippage: 2, // 2% slippage for liquidity provision
-                                fixedSide: 'base' // Base amount is fixed
-                            });
-                            
-                            elizaLogger.info(`✅ Liquidity added successfully!`);
-                            elizaLogger.info(`🔗 Transaction: ${txSignature}`);
-                            elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
-                            elizaLogger.info(`📋 Pool: ${newPoolId}`);
-                            
-                            // Check new LP balance
-                            await wait(5000, 7000);
                             try {
-                                const lpBalance = await getUserLpBalance(connection, walletKeypair.publicKey, newPoolId);
-                                const lpBalanceFormatted = (parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6);
-                                elizaLogger.info(`💰 New LP balance: ${lpBalanceFormatted} tokens`);
-                            } catch (balanceError) {
-                                elizaLogger.warn('Could not fetch new LP balance:', balanceError);
+                                // Calculate a more appropriate slippage based on the imbalance
+                                // With such imbalanced amounts, we need much higher slippage
+                                const slippagePercent = 50; // 50% slippage for extremely imbalanced positions
+                                
+                                elizaLogger.warn(`⚠️  Using ${slippagePercent}% slippage due to imbalanced token amounts`);
+                                elizaLogger.warn(`💡 Consider swapping tokens to achieve a more balanced ratio first`);
+                                
+                                const txSignature = await addLiquidity(connection, {
+                                    poolId: poolInfo.id,
+                                    baseAmountIn: baseAmount,
+                                    quoteAmountIn: quoteAmount,
+                                    walletKeypair: walletKeypair,
+                                    slippage: slippagePercent,
+                                    fixedSide: fixedSide
+                                });
+                                
+                                elizaLogger.info(`✅ Successfully added liquidity!`);
+                                elizaLogger.info(`🔗 Transaction: ${txSignature}`);
+                                elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
+                                
+                                // Wait a bit and check LP balance
+                                await wait(5000, 7000);
+                                const lpBalance = await getUserLpBalance(connection, walletPublicKey, poolInfo.id);
+                                elizaLogger.info(`💎 New LP token balance: ${(parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6)} LP tokens`);
+                                
+                            } catch (addLiqError: any) {
+                                elizaLogger.error(`❌ Failed to add liquidity:`, addLiqError.message);
+                                if (addLiqError.logs) {
+                                    elizaLogger.error(`   Logs:`, addLiqError.logs);
+                                }
                             }
-                            
-                            elizaLogger.info("✅ Step 7 completed: Liquidity added to new pool");
+                        } else {
+                            elizaLogger.warn(`❌ Insufficient token balances to add liquidity`);
+                            elizaLogger.warn(`   Base amount: ${baseAmount}`);
+                            elizaLogger.warn(`   Quote amount: ${quoteAmount}`);
                         }
                     }
+                    
+                    elizaLogger.info("✅ Step 7 completed: Liquidity addition attempted");
                     
                 } catch (error: any) {
                     elizaLogger.error("❌ Error in Step 7:", error.message);
                 }
             }
-   */         
+
             // Exit the loop after completing all steps
             elizaLogger.info("🏁 Yield optimizer completed: Full cycle executed!");
             elizaLogger.info("💡 Ready for next yield optimization cycle");

@@ -3,7 +3,9 @@ import {
     TxVersion,
     ApiV3PoolInfoItem,
     ApiV3PoolInfoStandardItem,
-    DEVNET_PROGRAM_ID
+    DEVNET_PROGRAM_ID,
+    TokenAmount,
+    Token
 } from '@raydium-io/raydium-sdk-v2';
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { getAssociatedTokenAddress } from '@solana/spl-token';
@@ -124,6 +126,16 @@ export async function addLiquidity(
             lpMint: poolInfo.lpMint?.address || poolInfo.lpMint
         });
         
+        // Check if the pool uses WSOL
+        const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+        const mintAAddress = poolInfo.mintA?.address || poolInfo.mintA;
+        const mintBAddress = poolInfo.mintB?.address || poolInfo.mintB;
+        const usesWSOL = mintAAddress === WSOL_MINT || mintBAddress === WSOL_MINT;
+        
+        if (usesWSOL) {
+            elizaLogger.info('⚠️  Pool uses WSOL (Wrapped SOL). Note: The SDK should handle SOL wrapping automatically.');
+        }
+        
         // Convert string amounts to BN
         const baseAmountBN = new BN(params.baseAmountIn);
         const quoteAmountBN = new BN(params.quoteAmountIn);
@@ -149,19 +161,65 @@ export async function addLiquidity(
         
         elizaLogger.info('Creating add liquidity transaction...');
         
-        // Build add liquidity transaction using BN amounts directly
-        // The SDK should handle token resolution internally when provided with pool info
+        // Build add liquidity transaction
+        // The SDK v2 uses a different format
+        // Make sure we have the complete pool info with token mints
+        if (!poolInfo.mintA || !poolInfo.mintB) {
+            throw new Error('Pool info missing token mint information');
+        }
+        
+        // Log the pool info structure to debug
+        elizaLogger.info('Pool info structure:', {
+            hasMintA: !!poolInfo.mintA,
+            mintAType: typeof poolInfo.mintA,
+            hasMintB: !!poolInfo.mintB,
+            mintBType: typeof poolInfo.mintB,
+            hasLpMint: !!poolInfo.lpMint,
+            lpMintType: typeof poolInfo.lpMint
+        });
+        
+        // Create Token instances from the pool info
+        const tokenA = new Token({
+            mint: new PublicKey(poolInfo.mintA.address),
+            decimals: poolInfo.mintA.decimals,
+            symbol: poolInfo.mintA.symbol,
+            name: poolInfo.mintA.name || poolInfo.mintA.symbol
+        });
+        
+        const tokenB = new Token({
+            mint: new PublicKey(poolInfo.mintB.address),
+            decimals: poolInfo.mintB.decimals,
+            symbol: poolInfo.mintB.symbol,
+            name: poolInfo.mintB.name || poolInfo.mintB.symbol
+        });
+        
+        // Create TokenAmount instances
+        const amountInA = new TokenAmount(tokenA, baseAmountBN);
+        const amountInB = new TokenAmount(tokenB, quoteAmountBN);
+        const otherAmountMinToken = fixedSide === 'a' 
+            ? new TokenAmount(tokenB, otherAmountMin)
+            : new TokenAmount(tokenA, otherAmountMin);
+        
+        elizaLogger.info('Token amounts created:', {
+            amountInA: amountInA.toFixed(),
+            amountInB: amountInB.toFixed(),
+            otherAmountMin: otherAmountMinToken.toFixed()
+        });
+        
+        // Create the add liquidity input
+        // Set config to create associated token accounts if needed
         const addLiqTx = await raydium.liquidity.addLiquidity({
             poolInfo: poolInfo,
             poolKeys: poolKeys, // Optional but helpful for efficiency
-            amountInA: baseAmountBN,
-            amountInB: quoteAmountBN,
-            otherAmountMin: otherAmountMin,
-            fixedSide: fixedSide as any,
+            amountInA: amountInA,
+            amountInB: amountInB,
+            otherAmountMin: otherAmountMinToken,
+            fixedSide: fixedSide as 'a' | 'b',
             config: {
                 bypassAssociatedCheck: false,
-                checkCreateATAOwner: false
-            }
+                checkCreateATAOwner: true // Ensure ATA creation for LP tokens
+            },
+            txVersion: TxVersion.V0 // Use versioned transactions for better compatibility
         });
         
         if (!addLiqTx) {
@@ -183,6 +241,7 @@ export async function addLiquidity(
             
             elizaLogger.info('🚀 Executing add liquidity transaction via SDK...');
             
+            // The SDK expects the owner to be provided with the keypair
             // Temporarily suppress console.log to avoid "simulate tx string" output
             const originalLog = console.log;
             console.log = () => {};
@@ -221,15 +280,18 @@ export async function addLiquidity(
                 elizaLogger.info('Fetching fresh blockhash...');
                 let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
                 
-                const tx = addLiqTx.transaction as any;
-                tx.recentBlockhash = blockhash;
-                tx.feePayer = params.walletKeypair.publicKey;
+                const tx = addLiqTx.transaction;
                 
-                if (tx.version === 'legacy' || !tx.version) {
-                    tx.sign(params.walletKeypair);
-                } else {
-                    // For versioned transactions
+                // Check if this is a VersionedTransaction (has 'message' property)
+                if ('message' in tx) {
+                    // This is a VersionedTransaction
+                    tx.message.recentBlockhash = blockhash;
                     tx.sign([params.walletKeypair]);
+                } else {
+                    // This is a legacy Transaction
+                    (tx as any).recentBlockhash = blockhash;
+                    (tx as any).feePayer = params.walletKeypair.publicKey;
+                    (tx as any).sign(params.walletKeypair);
                 }
                 
                 // Add retry logic for rate limiting and blockhash issues
@@ -238,11 +300,34 @@ export async function addLiquidity(
                     try {
                         elizaLogger.info(`📤 Sending transaction (attempt ${4 - retries}/3)...`);
                         
-                        // Try sending with skipPreflight true to avoid simulation issues
+                        // First try to simulate to get better error messages
+                        try {
+                            elizaLogger.info('🔍 Simulating transaction first...');
+                            const simulation = await connection.simulateTransaction(
+                                addLiqTx.transaction as any,
+                                undefined,
+                                true // include accounts for better debugging
+                            );
+                            if (simulation.value.err) {
+                                elizaLogger.error('❌ Transaction simulation failed:', JSON.stringify(simulation.value.err));
+                                if (simulation.value.logs && simulation.value.logs.length > 0) {
+                                    elizaLogger.error('📋 Program logs:');
+                                    simulation.value.logs.forEach((log: string, index: number) => {
+                                        elizaLogger.error(`   ${index}: ${log}`);
+                                    });
+                                }
+                            } else {
+                                elizaLogger.info('✅ Transaction simulation succeeded');
+                            }
+                        } catch (simError: any) {
+                            elizaLogger.warn('⚠️  Simulation failed:', simError.message);
+                        }
+                        
+                        // Try sending the transaction
                         const signature = await connection.sendRawTransaction(
                             addLiqTx.transaction.serialize(),
                             { 
-                                skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
+                                skipPreflight: false, // Don't skip preflight to see errors
                                 maxRetries: 3
                             }
                         );
@@ -299,11 +384,14 @@ export async function addLiquidity(
                             lastValidBlockHeight = freshBlockhash.lastValidBlockHeight;
                             
                             // Update transaction with fresh blockhash
-                            tx.recentBlockhash = blockhash;
-                            if (tx.version === 'legacy' || !tx.version) {
-                                tx.sign(params.walletKeypair);
-                            } else {
+                            if ('message' in tx) {
+                                // This is a VersionedTransaction
+                                tx.message.recentBlockhash = blockhash;
                                 tx.sign([params.walletKeypair]);
+                            } else {
+                                // This is a legacy Transaction
+                                (tx as any).recentBlockhash = blockhash;
+                                (tx as any).sign(params.walletKeypair);
                             }
                             
                             retries--;
