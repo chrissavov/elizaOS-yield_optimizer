@@ -70,39 +70,8 @@ export async function addLiquidity(
 ): Promise<string> {
     try {
         elizaLogger.info(`Adding liquidity to pool ${params.poolId}`);
-        
-        const raydium = await initializeRaydiumSdk(connection);
-        
-        // Fetch pool info
-        const poolInfo = await raydium.api.fetchPoolById({ ids: params.poolId });
-        if (!poolInfo || poolInfo.length === 0) {
-            throw new Error(`Pool ${params.poolId} not found`);
-        }
-
-        const pool = poolInfo[0] as ApiV3PoolInfoStandardItem;
-        
-        // Check if it's a standard AMM pool
-        if (!('baseReserve' in pool)) {
-            throw new Error('Pool is not a standard AMM pool');
-        }
-
-        // For now, we'll throw an error since the SDK v2 API is different
-        // and would require more complex implementation
-        throw new Error('Add liquidity not yet implemented for Raydium SDK v2. Please implement using Raydium SDK v2 demo as reference.');
-
-    } catch (error) {
-        elizaLogger.error('Error adding liquidity:', error);
-        throw error;
-    }
-}
-
-export async function removeLiquidity(
-    connection: Connection,
-    params: RemoveLiquidityParams
-): Promise<string> {
-    try {
-        elizaLogger.info(`Removing liquidity from pool ${params.poolId}`);
-        elizaLogger.info(`Amount: ${params.lpAmountIn}, Slippage: ${params.slippage}%`);
+        elizaLogger.info(`Base amount: ${params.baseAmountIn}, Quote amount: ${params.quoteAmountIn}`);
+        elizaLogger.info(`Slippage: ${params.slippage}%, Fixed side: ${params.fixedSide || 'base'}`);
         
         // Create a Raydium instance with the actual wallet
         const raydium = await Raydium.load({
@@ -113,60 +82,106 @@ export async function removeLiquidity(
 
         elizaLogger.info('Raydium instance created successfully');
 
-        // Fetch pool info using the helper method that returns both RPC data and API format
-        elizaLogger.info('Fetching pool info...');
-        const poolInfoResult = await raydium.liquidity.getPoolInfoFromRpc({ poolId: params.poolId });
+        // Fetch pool info using API to get complete token info including mint objects
+        elizaLogger.info('Fetching pool info from API...');
+        const poolDataArray = await raydium.api.fetchPoolById({ ids: params.poolId });
         
-        if (!poolInfoResult || !poolInfoResult.poolInfo) {
-            throw new Error(`Pool ${params.poolId} not found`);
+        if (!poolDataArray || poolDataArray.length === 0) {
+            throw new Error(`Pool ${params.poolId} not found via API`);
         }
 
-        const { poolInfo, poolKeys } = poolInfoResult;
+        const poolData = poolDataArray[0];
+        
+        // Check if this is a Standard AMM pool (required for liquidity operations)
+        if (poolData.type !== 'Standard') {
+            throw new Error(`Pool ${params.poolId} is not a Standard AMM pool (type: ${poolData.type}). Liquidity operations are only supported for Standard AMM pools.`);
+        }
+        
+        const poolInfo = poolData as ApiV3PoolInfoStandardItem;
+        elizaLogger.info('Pool info from API:', {
+            id: poolInfo.id,
+            programId: poolInfo.programId,
+            type: poolInfo.type,
+            mintA: poolInfo.mintA,
+            mintB: poolInfo.mintB,
+            lpMint: poolInfo.lpMint
+        });
+
+        // Get pool keys for efficiency (optional but recommended)
+        let poolKeys: any;
+        try {
+            const poolInfoResult = await raydium.liquidity.getPoolInfoFromRpc({ poolId: params.poolId });
+            poolKeys = poolInfoResult?.poolKeys;
+        } catch (err) {
+            elizaLogger.warn('Could not fetch pool keys, continuing without them:', err.message);
+        }
         
         elizaLogger.info(`Pool info retrieved:`, {
             id: poolInfo.id,
             programId: poolInfo.programId,
-            baseMint: poolInfo.mintA.address,
-            quoteMint: poolInfo.mintB.address,
-            lpMint: poolInfo.lpMint.address
+            baseMint: poolInfo.mintA?.address || poolInfo.mintA,
+            quoteMint: poolInfo.mintB?.address || poolInfo.mintB,
+            lpMint: poolInfo.lpMint?.address || poolInfo.lpMint
         });
         
-        // Calculate slippage - convert from percentage to proper amounts
-        const slippageBps = Math.floor(params.slippage * 100); // Convert percentage to basis points
+        // Convert string amounts to BN
+        const baseAmountBN = new BN(params.baseAmountIn);
+        const quoteAmountBN = new BN(params.quoteAmountIn);
         
-        elizaLogger.info('Building remove liquidity transaction...');
+        // Calculate slippage for the other amount
+        const slippageMultiplier = 1 - (params.slippage || 1) / 100;
+        const fixedSide = params.fixedSide === 'quote' ? 'b' : 'a'; // Convert to SDK format
         
-        // Build remove liquidity transaction
-        // For simplicity, we're using 0 for min amounts, but in production you'd calculate based on slippage
-        const removeLiqTx = await raydium.liquidity.removeLiquidity({
+        let otherAmountMin: BN;
+        
+        if (fixedSide === 'a') {
+            // Base amount (A) is fixed, calculate minimum quote amount (B) with slippage
+            otherAmountMin = new BN(Math.floor(quoteAmountBN.toNumber() * slippageMultiplier));
+        } else {
+            // Quote amount (B) is fixed, calculate minimum base amount (A) with slippage
+            otherAmountMin = new BN(Math.floor(baseAmountBN.toNumber() * slippageMultiplier));
+        }
+        
+        elizaLogger.info('Building add liquidity transaction...');
+        elizaLogger.info(`Base Amount (A): ${baseAmountBN.toString()}, Quote Amount (B): ${quoteAmountBN.toString()}`);
+        elizaLogger.info(`Minimum other amount: ${otherAmountMin.toString()}`);
+        elizaLogger.info(`Fixed side: ${fixedSide}`);
+        
+        elizaLogger.info('Creating add liquidity transaction...');
+        
+        // Build add liquidity transaction using BN amounts directly
+        // The SDK should handle token resolution internally when provided with pool info
+        const addLiqTx = await raydium.liquidity.addLiquidity({
             poolInfo: poolInfo,
             poolKeys: poolKeys, // Optional but helpful for efficiency
-            lpAmount: new BN(params.lpAmountIn),
-            baseAmountMin: new BN(0), // TODO: Calculate based on slippage
-            quoteAmountMin: new BN(0), // TODO: Calculate based on slippage
+            amountInA: baseAmountBN,
+            amountInB: quoteAmountBN,
+            otherAmountMin: otherAmountMin,
+            fixedSide: fixedSide as any,
             config: {
                 bypassAssociatedCheck: false,
                 checkCreateATAOwner: false
             }
         });
         
-        if (!removeLiqTx) {
-            throw new Error('Failed to build remove liquidity transaction');
+        if (!addLiqTx) {
+            throw new Error('Failed to build add liquidity transaction');
         }
         
-        elizaLogger.info('Executing remove liquidity transaction...');
+        elizaLogger.info('Executing add liquidity transaction...');
         elizaLogger.info(`🔗 Pool: ${params.poolId}`);
-        elizaLogger.info(`💧 LP Amount: ${params.lpAmountIn}`);
+        elizaLogger.info(`💰 Base Amount: ${params.baseAmountIn}`);
+        elizaLogger.info(`💰 Quote Amount: ${params.quoteAmountIn}`);
         elizaLogger.info(`📊 Slippage: ${params.slippage}%`);
         elizaLogger.info(`👤 Wallet: ${params.walletKeypair.publicKey.toString()}`);
         
         // Execute transaction using the SDK's built-in method
         try {
-            // Add longer delay to avoid rate limiting
+            // Add delay to avoid rate limiting
             elizaLogger.info('⏳ Waiting 10 seconds to avoid rate limiting...');
             await new Promise(resolve => setTimeout(resolve, 10000));
             
-            elizaLogger.info('🚀 Executing remove liquidity transaction via SDK...');
+            elizaLogger.info('🚀 Executing add liquidity transaction via SDK...');
             
             // Temporarily suppress console.log to avoid "simulate tx string" output
             const originalLog = console.log;
@@ -174,7 +189,7 @@ export async function removeLiquidity(
             
             let result: any;
             try {
-                result = await removeLiqTx.execute();
+                result = await addLiqTx.execute();
             } finally {
                 // Restore console.log
                 console.log = originalLog;
@@ -182,9 +197,10 @@ export async function removeLiquidity(
             
             const txId = typeof result === 'string' ? result : result?.txId;
             
-            elizaLogger.info(`✅ Remove liquidity transaction successful!`);
+            elizaLogger.info(`✅ Add liquidity transaction successful!`);
             elizaLogger.info(`🔗 Transaction ID: ${txId}`);
             elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${txId}`);
+            elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${txId}`);
             
             return txId;
         } catch (execError: any) {
@@ -200,12 +216,12 @@ export async function removeLiquidity(
             
             // Try manual transaction sending as fallback
             elizaLogger.info('🔄 Falling back to manual transaction sending...');
-            if (removeLiqTx.transaction) {
+            if (addLiqTx.transaction) {
                 // Get fresh blockhash
                 elizaLogger.info('Fetching fresh blockhash...');
                 let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
                 
-                const tx = removeLiqTx.transaction as any;
+                const tx = addLiqTx.transaction as any;
                 tx.recentBlockhash = blockhash;
                 tx.feePayer = params.walletKeypair.publicKey;
                 
@@ -224,7 +240,7 @@ export async function removeLiquidity(
                         
                         // Try sending with skipPreflight true to avoid simulation issues
                         const signature = await connection.sendRawTransaction(
-                            removeLiqTx.transaction.serialize(),
+                            addLiqTx.transaction.serialize(),
                             { 
                                 skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
                                 maxRetries: 3
@@ -257,7 +273,7 @@ export async function removeLiquidity(
                         }
                         
                         if (confirmed) {
-                            elizaLogger.info(`✅ Remove liquidity transaction successful!`);
+                            elizaLogger.info(`✅ Add liquidity transaction successful!`);
                         } else {
                             elizaLogger.warn(`⚠️  Transaction confirmation timeout, but transaction may still be successful`);
                         }
@@ -299,6 +315,211 @@ export async function removeLiquidity(
             }
             throw execError;
         }
+
+    } catch (error) {
+        elizaLogger.error('Error adding liquidity:', error);
+        throw error;
+    }
+}
+
+/**
+ * Remove liquidity from a Raydium pool
+ * 
+ * This function uses direct transaction signing and sending instead of the SDK's execute() method
+ * to provide more control over the transaction process and better handle edge cases.
+ * 
+ * @param connection - Solana connection object
+ * @param params - Parameters for removing liquidity
+ * @returns Transaction signature
+ */
+export async function removeLiquidity(
+    connection: Connection,
+    params: RemoveLiquidityParams
+): Promise<string> {
+    try {
+        elizaLogger.info(`Removing liquidity from pool ${params.poolId}`);
+        elizaLogger.info(`Amount: ${params.lpAmountIn}, Slippage: ${params.slippage}%`);
+        
+        // Create a Raydium instance with the actual wallet
+        const raydium = await Raydium.load({
+            connection: connection as any,
+            owner: params.walletKeypair.publicKey,
+            disableLoadToken: false
+        });
+
+        elizaLogger.info('Raydium instance created successfully');
+
+        // Fetch pool info using API to get complete token info including mint objects
+        elizaLogger.info('Fetching pool info from API...');
+        const poolDataArray = await raydium.api.fetchPoolById({ ids: params.poolId });
+        
+        if (!poolDataArray || poolDataArray.length === 0) {
+            throw new Error(`Pool ${params.poolId} not found via API`);
+        }
+
+        const poolData = poolDataArray[0];
+        
+        // Check if this is a Standard AMM pool (required for liquidity operations)
+        if (poolData.type !== 'Standard') {
+            throw new Error(`Pool ${params.poolId} is not a Standard AMM pool (type: ${poolData.type}). Liquidity operations are only supported for Standard AMM pools.`);
+        }
+        
+        const poolInfo = poolData as ApiV3PoolInfoStandardItem;
+
+        // Get pool keys for efficiency (optional but recommended)
+        let poolKeys: any;
+        try {
+            const poolInfoResult = await raydium.liquidity.getPoolInfoFromRpc({ poolId: params.poolId });
+            poolKeys = poolInfoResult?.poolKeys;
+        } catch (err) {
+            elizaLogger.warn('Could not fetch pool keys, continuing without them:', err.message);
+        }
+        
+        elizaLogger.info(`Pool info retrieved:`, {
+            id: poolInfo.id,
+            programId: poolInfo.programId,
+            baseMint: poolInfo.mintA?.address || poolInfo.mintA,
+            quoteMint: poolInfo.mintB?.address || poolInfo.mintB,
+            lpMint: poolInfo.lpMint?.address || poolInfo.lpMint
+        });
+        
+        // Calculate slippage - convert from percentage to proper amounts
+        // const slippageBps = Math.floor(params.slippage * 100); // Convert percentage to basis points
+        
+        elizaLogger.info('Building remove liquidity transaction...');
+        
+        // Build remove liquidity transaction
+        // For simplicity, we're using 0 for min amounts, but in production you'd calculate based on slippage
+        const removeLiqTx = await raydium.liquidity.removeLiquidity({
+            poolInfo: poolInfo,
+            poolKeys: poolKeys, // Optional but helpful for efficiency
+            lpAmount: new BN(params.lpAmountIn),
+            baseAmountMin: new BN(0), // TODO: Calculate based on slippage
+            quoteAmountMin: new BN(0), // TODO: Calculate based on slippage
+            config: {
+                bypassAssociatedCheck: false,
+                checkCreateATAOwner: false
+            }
+        });
+        
+        if (!removeLiqTx) {
+            throw new Error('Failed to build remove liquidity transaction');
+        }
+        
+        elizaLogger.info('Executing remove liquidity transaction...');
+        elizaLogger.info(`🔗 Pool: ${params.poolId}`);
+        elizaLogger.info(`💧 LP Amount: ${params.lpAmountIn}`);
+        elizaLogger.info(`📊 Slippage: ${params.slippage}%`);
+        elizaLogger.info(`👤 Wallet: ${params.walletKeypair.publicKey.toString()}`);
+        
+        // Direct manual transaction sending without SDK execute attempt
+        // Add delay to avoid rate limiting
+        elizaLogger.info('⏳ Waiting 10 seconds to avoid rate limiting...');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        
+        elizaLogger.info('🚀 Executing remove liquidity transaction...');
+        
+        if (!removeLiqTx.transaction) {
+            throw new Error('No transaction object available');
+        }
+        
+        // Get fresh blockhash
+        elizaLogger.info('Fetching fresh blockhash...');
+        let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        
+        const tx = removeLiqTx.transaction as any;
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = params.walletKeypair.publicKey;
+        
+        if (tx.version === 'legacy' || !tx.version) {
+            tx.sign(params.walletKeypair);
+        } else {
+            // For versioned transactions
+            tx.sign([params.walletKeypair]);
+        }
+        
+        // Add retry logic for rate limiting and blockhash issues
+        let retries = 3;
+        while (retries > 0) {
+            try {
+                elizaLogger.info(`📤 Sending transaction (attempt ${4 - retries}/3)...`);
+                
+                // Try sending with skipPreflight true to avoid simulation issues
+                const signature = await connection.sendRawTransaction(
+                    removeLiqTx.transaction.serialize(),
+                    { 
+                        skipPreflight: true, // Skip preflight to avoid blockhash simulation issues
+                        maxRetries: 3
+                    }
+                );
+                
+                elizaLogger.info(`📋 Transaction sent with signature: ${signature}`);
+                elizaLogger.info(`⏳ Waiting for confirmation...`);
+                
+                // Use polling-based confirmation to avoid WebSocket
+                elizaLogger.info(`⏳ Confirming transaction...`);
+                
+                // Poll for transaction status instead of using WebSocket
+                let confirmed = false;
+                const maxAttempts = 30;
+                for (let i = 0; i < maxAttempts; i++) {
+                    try {
+                        const status = await connection.getSignatureStatus(signature);
+                        if (status?.value?.confirmationStatus === 'confirmed' || 
+                            status?.value?.confirmationStatus === 'finalized') {
+                            confirmed = true;
+                            break;
+                        }
+                    } catch (e) {
+                        // Ignore errors during polling
+                    }
+                    
+                    // Wait 1 second between polls
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                
+                if (confirmed) {
+                    elizaLogger.info(`✅ Remove liquidity transaction successful!`);
+                } else {
+                    elizaLogger.warn(`⚠️  Transaction confirmation timeout, but transaction may still be successful`);
+                }
+                
+                elizaLogger.info(`🔗 Transaction ID: ${signature}`);
+                elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${signature}`);
+                elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
+                
+                return signature;
+                
+            } catch (sendError: any) {
+                elizaLogger.warn(`⚠️  Transaction send attempt ${4 - retries}/3 failed: ${sendError.message}`);
+                
+                if (sendError.message?.includes('429') && retries > 1) {
+                    elizaLogger.warn(`Rate limited, waiting before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, 10000));
+                    retries--;
+                } else if (sendError.message?.includes('Blockhash not found') && retries > 1) {
+                    elizaLogger.warn(`Blockhash expired, getting fresh blockhash and retrying...`);
+                    // Get a fresh blockhash for retry
+                    const freshBlockhash = await connection.getLatestBlockhash('confirmed');
+                    blockhash = freshBlockhash.blockhash;
+                    lastValidBlockHeight = freshBlockhash.lastValidBlockHeight;
+                    
+                    // Update transaction with fresh blockhash
+                    tx.recentBlockhash = blockhash;
+                    if (tx.version === 'legacy' || !tx.version) {
+                        tx.sign(params.walletKeypair);
+                    } else {
+                        tx.sign([params.walletKeypair]);
+                    }
+                    
+                    retries--;
+                } else {
+                    throw sendError;
+                }
+            }
+        }
+        
+        throw new Error('Failed to send transaction after all retries');
 
     } catch (error) {
         elizaLogger.error('Error removing liquidity:', error);
