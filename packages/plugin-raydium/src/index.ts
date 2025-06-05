@@ -188,8 +188,6 @@ export async function getUserRaydiumPositions(userPublicKey: string | PublicKey,
     const mint = new PublicKey(data.slice(0, 32)).toString();
     const amount = data.readBigUInt64LE(64);
     
-    console.log(`[RaydiumPlugin] Checking token ${mint} with balance ${amount.toString()}`);
-    
     // Check if this is a Raydium LP token using our enhanced function
     const poolData = await isRaydiumLpToken(mint);
     if (poolData) {
@@ -205,17 +203,12 @@ export async function getUserRaydiumPositions(userPublicKey: string | PublicKey,
           poolInfo: poolData,
         });
         console.log(`[RaydiumPlugin] ✅ Found unstaked LP position: Pool ${poolData.id}, Balance: ${amount.toString()}`);
-      } else {
-        console.log(`[RaydiumPlugin] 📋 Found LP token with 0 balance: ${mint} (may be farmed)`);
       }
-    } else {
-      console.log(`[RaydiumPlugin] ❌ Token ${mint} is not a Raydium LP token`);
     }
   }
   
   console.log(`[RaydiumPlugin] Found ${allLpTokens.size} total LP tokens, ${positions.length} with non-zero balance`);
   
-  console.log(`[RaydiumPlugin] Total unstaked LP positions found: ${positions.length}`);
   return positions;
 }
 
