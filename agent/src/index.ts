@@ -40,6 +40,7 @@ import { createJupiterApiClient } from '@jup-ag/api';
 import { swapToken } from "@elizaos/plugin-solana";
 import { Keypair, Connection, VersionedTransaction, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
+import BN from "bn.js";
 import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserLpBalance, poolContainsSol, removeLiquidity, addLiquidity } from '@elizaos/plugin-raydium';
 
 // SPL Token Program ID
@@ -1101,24 +1102,87 @@ async function startYieldOptimizerLoop(runtime) {
                             continue;
                         }
                         
-                        // Execute swap
+                        // Execute swap with retry logic
                         const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
-                        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+                        let transaction = VersionedTransaction.deserialize(swapTransactionBuf);
                         transaction.sign([walletKeypair]);
                         
                         const beforeSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
-                        const signature = await connection.sendTransaction(transaction, {
-                            maxRetries: 3,
-                            skipPreflight: false
-                        });
                         
-                        // Wait for confirmation
+                        // Try to send transaction with retries for blockhash expiry
+                        let signature: string;
+                        let sendAttempts = 0;
+                        const maxSendAttempts = 3;
+                        
+                        while (sendAttempts < maxSendAttempts) {
+                            try {
+                                signature = await connection.sendTransaction(transaction, {
+                                    maxRetries: 3,
+                                    skipPreflight: false
+                                });
+                                break; // Success, exit loop
+                            } catch (sendError: any) {
+                                sendAttempts++;
+                                if (sendError.message?.includes('block height exceeded') && sendAttempts < maxSendAttempts) {
+                                    elizaLogger.warn(`⚠️ Blockhash expired, getting new quote (attempt ${sendAttempts + 1}/${maxSendAttempts})...`);
+                                    // Get a fresh quote and transaction
+                                    const freshQuoteResponse = await fetch(
+                                        `https://quote-api.jup.ag/v6/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${tokenBalance}&slippageBps=50`
+                                    );
+                                    const freshQuoteData = await freshQuoteResponse.json();
+                                    
+                                    const freshSwapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            quoteResponse: freshQuoteData,
+                                            userPublicKey: walletKeypair.publicKey.toString(),
+                                            wrapAndUnwrapSol: true,
+                                            dynamicComputeUnitLimit: true,
+                                            prioritizationFeeLamports: 'auto'
+                                        })
+                                    });
+                                    const freshSwapData = await freshSwapResponse.json();
+                                    
+                                    const freshTransaction = VersionedTransaction.deserialize(
+                                        Buffer.from(freshSwapData.swapTransaction, 'base64')
+                                    );
+                                    freshTransaction.sign([walletKeypair]);
+                                    transaction = freshTransaction;
+                                    
+                                    await wait(1000, 2000); // Wait before retry
+                                } else {
+                                    throw sendError;
+                                }
+                            }
+                        }
+                        
+                        if (!signature!) {
+                            throw new Error('Failed to send transaction after all attempts');
+                        }
+                        
+                        // Wait for confirmation with timeout
                         const latestBlockhash = await connection.getLatestBlockhash();
-                        await connection.confirmTransaction({
-                            signature,
-                            blockhash: latestBlockhash.blockhash,
-                            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
-                        }, 'confirmed');
+                        try {
+                            await connection.confirmTransaction({
+                                signature,
+                                blockhash: latestBlockhash.blockhash,
+                                lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+                            }, 'confirmed');
+                        } catch (confirmError: any) {
+                            if (confirmError.message?.includes('block height exceeded')) {
+                                elizaLogger.warn('⚠️ Transaction confirmation timed out, checking status...');
+                                // Check if transaction was successful despite timeout
+                                const status = await connection.getSignatureStatus(signature);
+                                if (!status?.value?.err) {
+                                    elizaLogger.info('✅ Transaction succeeded despite timeout');
+                                } else {
+                                    throw confirmError;
+                                }
+                            } else {
+                                throw confirmError;
+                            }
+                        }
                         
                         const afterSOL = await connection.getBalance(walletKeypair.publicKey) / 1e9;
                         const outputSol = quoteData.outAmount ? parseFloat(quoteData.outAmount) / 1e9 : 0;
@@ -1272,27 +1336,96 @@ async function startYieldOptimizerLoop(runtime) {
                         
                         elizaLogger.info(`💰 Other token balance: ${otherTokenUiBalance} (${otherTokenBalance} raw)`);
                         
-                        // Determine which token is base (A) and which is quote (B)
-                        // In Raydium, token A is usually the non-SOL token, and token B is SOL/WSOL
+                        // Fetch current pool reserves to calculate optimal amounts
+                        elizaLogger.info("📊 Fetching current pool reserves...");
+                        const poolReserves = await getRaydiumPoolInfo(poolInfo.id, connection.rpcEndpoint);
+                        
+                        if (!poolReserves || !poolReserves.baseReserve || !poolReserves.quoteReserve) {
+                            elizaLogger.error("❌ Failed to fetch pool reserves");
+                            throw new Error("Cannot get pool reserves");
+                        }
+                        
+                        elizaLogger.info(`📊 Pool reserves - Base: ${poolReserves.baseReserve}, Quote: ${poolReserves.quoteReserve}`);
+                        
+                        // Calculate optimal amounts based on pool ratio
                         let baseAmount: string;
                         let quoteAmount: string;
                         let fixedSide: 'base' | 'quote';
                         
+                        const baseReserve = new BN(poolReserves.baseReserve);
+                        const quoteReserve = new BN(poolReserves.quoteReserve);
+                        
+                        // Calculate pool price (quote per base)
+                        const poolPrice = quoteReserve.mul(new BN(10).pow(new BN(poolInfo.mintADecimals)))
+                            .div(baseReserve.mul(new BN(10).pow(new BN(poolInfo.mintBDecimals))));
+                        
+                        elizaLogger.info(`📊 Pool price: ${poolPrice.toString()} (quote per base, normalized)`);
+                        elizaLogger.info(`📊 mintA: ${mintA}, mintB: ${mintB}, SOL_MINT: ${SOL_MINT}`);
+                        
                         if (mintA === SOL_MINT) {
                             // SOL is token A (base), other token is B (quote)
-                            // Use most of SOL balance, keeping MIN_SOL_BALANCE for fees
-                            const solToUse = Math.max(0, solBalance - MIN_SOL_BALANCE);
-                            baseAmount = Math.floor(solToUse * 1e9).toString(); // Convert to lamports
-                            quoteAmount = otherTokenBalance; // Use all other token balance
-                            fixedSide = 'quote'; // Fix the other token amount
-                            elizaLogger.info(`📊 Using ${solToUse.toFixed(6)} SOL as base token`);
+                            // BOME-WSOL pool: mintA=BOME, mintB=WSOL, but we have it backwards
+                            // So we need to swap our understanding
+                            elizaLogger.warn(`⚠️ Token order mismatch detected - adjusting logic`);
+                            
+                            // Actually: BOME is base (A), WSOL is quote (B)
+                            // We have BOME tokens and SOL
+                            // Use all BOME tokens as base
+                            baseAmount = otherTokenBalance; // BOME amount
+                            
+                            // Calculate required WSOL based on pool ratio
+                            const requiredQuote = new BN(otherTokenBalance).mul(quoteReserve).div(baseReserve);
+                            
+                            // When using fixedSide='base', quoteAmountIn should be the MAXIMUM we're willing to provide
+                            // Add extra buffer for slippage (SDK will handle the exact calculation internally)
+                            const slippageBuffer = 1.1; // 10% buffer on top of slippage parameter
+                            const maxQuoteAmount = requiredQuote.muln(slippageBuffer);
+                            
+                            // Always use the max amount with buffer - SDK will calculate exact amount needed
+                            quoteAmount = maxQuoteAmount.toString();
+                            
+                            // Just log the information
+                            const availableSol = (solBalance - MIN_SOL_BALANCE) * 1e9; // Convert to lamports
+                            const actualMinReserve = 0.02; // We can go lower if needed
+                            const maxAvailableSol = (solBalance - actualMinReserve) * 1e9;
+                            
+                            fixedSide = 'base'; // Fix BOME amount
+                            
+                            elizaLogger.info(`📊 Using ${otherTokenUiBalance} BOME as base (fixed)`);
+                            elizaLogger.info(`📊 Calculated required WSOL: ${requiredQuote.toNumber() / 1e9} SOL`);
+                            elizaLogger.info(`📊 Max WSOL to provide (with buffer): ${maxQuoteAmount.toNumber() / 1e9} SOL`);
+                            elizaLogger.info(`📊 Available SOL (minus 0.05 reserve): ${availableSol / 1e9} SOL`);
+                            elizaLogger.info(`📊 Available SOL (minus 0.02 reserve): ${maxAvailableSol / 1e9} SOL`);
+                            elizaLogger.info(`📊 Total SOL balance: ${solBalance} SOL`);
                         } else {
                             // Other token is A (base), SOL is B (quote)
-                            baseAmount = otherTokenBalance; // Use all other token balance
-                            const solToUse = Math.max(0, solBalance - MIN_SOL_BALANCE);
-                            quoteAmount = Math.floor(solToUse * 1e9).toString(); // Convert to lamports
-                            fixedSide = 'base'; // Fix the other token amount
-                            elizaLogger.info(`📊 Using ${otherTokenUiBalance} ${parsed.symbol.split('-')[0]} as base token`);
+                            // This is the normal case: Token-WSOL
+                            baseAmount = otherTokenBalance; // Other token amount
+                            
+                            // Calculate required WSOL based on pool ratio
+                            const requiredQuote = new BN(otherTokenBalance).mul(quoteReserve).div(baseReserve);
+                            
+                            // When using fixedSide='base', quoteAmountIn should be the MAXIMUM we're willing to provide
+                            // Add extra buffer for slippage (SDK will handle the exact calculation internally)
+                            const slippageBuffer = 1.1; // 10% buffer on top of slippage parameter
+                            const maxQuoteAmount = requiredQuote.muln(slippageBuffer);
+                            
+                            // Always use the max amount with buffer - SDK will calculate exact amount needed
+                            quoteAmount = maxQuoteAmount.toString();
+                            
+                            // Just log the information
+                            const availableSol = (solBalance - MIN_SOL_BALANCE) * 1e9; // Convert to lamports
+                            const actualMinReserve = 0.02; // We can go lower if needed
+                            const maxAvailableSol = (solBalance - actualMinReserve) * 1e9;
+                            
+                            fixedSide = 'base'; // Fix other token amount
+                            
+                            elizaLogger.info(`📊 Using ${otherTokenUiBalance} ${parsed.symbol.split('-')[0]} as base (fixed)`);
+                            elizaLogger.info(`📊 Calculated required WSOL: ${requiredQuote.toNumber() / 1e9} SOL`);
+                            elizaLogger.info(`📊 Max WSOL to provide (with buffer): ${maxQuoteAmount.toNumber() / 1e9} SOL`);
+                            elizaLogger.info(`📊 Available SOL (minus 0.05 reserve): ${availableSol / 1e9} SOL`);
+                            elizaLogger.info(`📊 Available SOL (minus 0.02 reserve): ${maxAvailableSol / 1e9} SOL`);
+                            elizaLogger.info(`📊 Total SOL balance: ${solBalance} SOL`);
                         }
                         
                         if (parseInt(baseAmount) > 0 && parseInt(quoteAmount) > 0) {
@@ -1303,30 +1436,67 @@ async function startYieldOptimizerLoop(runtime) {
                             elizaLogger.info(`   Pool symbol: ${parsed.symbol}`);
                             
                             try {
-                                // Calculate a more appropriate slippage based on the imbalance
-                                // With such imbalanced amounts, we need much higher slippage
-                                const slippagePercent = 50; // 50% slippage for extremely imbalanced positions
+                                // Use much higher slippage to account for price movements and calculation differences
+                                const slippagePercent = 10;
                                 
-                                elizaLogger.warn(`⚠️  Using ${slippagePercent}% slippage due to imbalanced token amounts`);
-                                elizaLogger.warn(`💡 Consider swapping tokens to achieve a more balanced ratio first`);
+                                elizaLogger.info(`📊 Using ${slippagePercent}% slippage to handle price movements`);
                                 
-                                const txSignature = await addLiquidity(connection, {
-                                    poolId: poolInfo.id,
-                                    baseAmountIn: baseAmount,
-                                    quoteAmountIn: quoteAmount,
-                                    walletKeypair: walletKeypair,
-                                    slippage: slippagePercent,
-                                    fixedSide: fixedSide
-                                });
-                                
-                                elizaLogger.info(`✅ Successfully added liquidity!`);
-                                elizaLogger.info(`🔗 Transaction: ${txSignature}`);
-                                elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
-                                
-                                // Wait a bit and check LP balance
-                                await wait(5000, 7000);
-                                const lpBalance = await getUserLpBalance(connection, walletPublicKey, poolInfo.id);
-                                elizaLogger.info(`💎 New LP token balance: ${(parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6)} LP tokens`);
+                                // First attempt with calculated amounts
+                                try {
+                                    const txSignature = await addLiquidity(connection, {
+                                        poolId: poolInfo.id,
+                                        baseAmountIn: baseAmount,
+                                        quoteAmountIn: quoteAmount,
+                                        walletKeypair: walletKeypair,
+                                        slippage: slippagePercent,
+                                        fixedSide: fixedSide
+                                    });
+                                    
+                                    elizaLogger.info(`✅ Successfully added liquidity!`);
+                                    elizaLogger.info(`🔗 Transaction: ${txSignature}`);
+                                    elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
+                                    
+                                    // Wait a bit and check LP balance
+                                    await wait(5000, 7000);
+                                    const lpBalance = await getUserLpBalance(connection, walletPublicKey, poolInfo.id);
+                                    elizaLogger.info(`💎 New LP token balance: ${(parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6)} LP tokens`);
+                                    
+                                } catch (firstAttemptError: any) {
+                                    if (firstAttemptError.message?.includes('exceeds desired slippage limit')) {
+                                        elizaLogger.warn(`⚠️ First attempt failed due to slippage. Trying alternative approach...`);
+                                        
+                                        // Alternative: Fix the quote (SOL) amount instead
+                                        const availableSolLamports = Math.floor((solBalance - MIN_SOL_BALANCE) * 0.9 * 1e9); // Use 90% of available SOL
+                                        const calculatedBase = new BN(availableSolLamports).mul(baseReserve).div(quoteReserve);
+                                        
+                                        elizaLogger.info(`🔄 Alternative approach: Fix SOL amount`);
+                                        elizaLogger.info(`   Fixed SOL amount: ${availableSolLamports / 1e9} SOL`);
+                                        elizaLogger.info(`   Calculated base amount: ${calculatedBase.toString()}`);
+                                        
+                                        // Make sure we don't exceed available tokens
+                                        const finalBaseAmount = BN.min(calculatedBase, new BN(otherTokenBalance)).toString();
+                                        
+                                        const txSignature = await addLiquidity(connection, {
+                                            poolId: poolInfo.id,
+                                            baseAmountIn: finalBaseAmount,
+                                            quoteAmountIn: availableSolLamports.toString(),
+                                            walletKeypair: walletKeypair,
+                                            slippage: slippagePercent,
+                                            fixedSide: 'quote' // Fix SOL amount instead
+                                        });
+                                        
+                                        elizaLogger.info(`✅ Successfully added liquidity (alternative approach)!`);
+                                        elizaLogger.info(`🔗 Transaction: ${txSignature}`);
+                                        elizaLogger.info(`🌐 Explorer: https://solscan.io/tx/${txSignature}`);
+                                        
+                                        // Wait a bit and check LP balance
+                                        await wait(5000, 7000);
+                                        const lpBalance = await getUserLpBalance(connection, walletPublicKey, poolInfo.id);
+                                        elizaLogger.info(`💎 New LP token balance: ${(parseInt(lpBalance.balance) / Math.pow(10, lpBalance.decimals)).toFixed(6)} LP tokens`);
+                                    } else {
+                                        throw firstAttemptError;
+                                    }
+                                }
                                 
                             } catch (addLiqError: any) {
                                 elizaLogger.error(`❌ Failed to add liquidity:`, addLiqError.message);
