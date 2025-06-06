@@ -1520,7 +1520,7 @@ async function startYieldOptimizerLoop(runtime: any) {
     
     // Configuration
     const config = {
-        scanIntervalMs: 1 * 60 * 1000, // 5 minutes
+        scanIntervalMs: 30 * 60 * 1000, // 30 minutes
         SOL_MINT: "So11111111111111111111111111111111111111112",
         walletPublicKey: settings.SOLANA_PUBLIC_KEY!,
         walletPrivateKey: settings.SOLANA_PRIVATE_KEY!,
