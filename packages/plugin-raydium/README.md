@@ -1,6 +1,6 @@
 # @elizaos/plugin-raydium
 
-Raydium AMM plugin for ElizaOS providing liquidity pool and farm position information on Solana.
+Raydium AMM utility library for ElizaOS providing pool information and liquidity management functions on Solana.
 
 ## Installation
 
@@ -10,22 +10,24 @@ npm install @elizaos/plugin-raydium
 
 ## Overview
 
-This plugin provides integration with Raydium AMM on Solana, enabling:
+This plugin provides a utility library for interacting with Raydium AMM on Solana. It exports raw functions for:
 - Pool information retrieval
 - Token symbol to mint address resolution
 - User LP position tracking
-- Farm position monitoring
+- Liquidity management operations
+
+**Note:** This plugin currently provides utility functions only and does not include ElizaOS actions or evaluators.
 
 ## Usage
 
 ```typescript
 import raydiumPlugin from '@elizaos/plugin-raydium';
 
-// Add to your agent's plugins
-const agent = new AgentRuntime({
-  plugins: [raydiumPlugin],
-  // ... other configuration
-});
+// The plugin exports utility functions directly
+const { getRaydiumPoolInfo, getUserRaydiumPositions } = raydiumPlugin;
+
+// Use the functions programmatically
+const poolInfo = await getRaydiumPoolInfo('poolIdHere');
 ```
 
 ## Exported Functions
@@ -55,15 +57,15 @@ const pool = await findRaydiumPoolByMints(mintA, mintB);
 
 ### Token Resolution
 
+#### `getMintForSymbol(symbol: string, raydiumInstance: Raydium): Promise<string | null>`
+Get mint address for a single token symbol.
+
 #### `getMintsForSymbol(symbol: string, rpcUrl?: string): Promise<MintAddresses>`
 Get mint addresses for a token pair symbol.
 
 ```typescript
 const { mintA, mintB } = await getMintsForSymbol('SOL-USDC');
 ```
-
-#### `getMintForSymbol(symbol: string, raydiumInstance: Raydium): Promise<string | null>`
-Get mint address for a single token symbol.
 
 ### User Positions
 
@@ -74,15 +76,43 @@ Get all Raydium LP positions for a user.
 const positions = await getUserRaydiumPositions('userPublicKeyHere');
 ```
 
-#### `getUserFarmPosition(userPublicKey: string | PublicKey, lpMint: string, rpcUrl?: string): Promise<FarmPosition[]>`
-Get farm positions for a specific LP token.
+#### `getAllUserPositions(connection: Connection, userPublicKey: PublicKey): Promise<UserRaydiumPosition[]>`
+Get all user positions using a provided connection.
+
+### Liquidity Management
+
+#### `addLiquidity(connection: Connection, params: AddLiquidityParams): Promise<TransactionSignature>`
+Add liquidity to a Raydium pool.
 
 ```typescript
-const farmPositions = await getUserFarmPosition('userPublicKey', 'lpMintAddress');
+const txSignature = await addLiquidity(connection, {
+  poolId: 'poolIdHere',
+  amountA: 1000,
+  amountB: 2000,
+  slippage: 0.01,
+  owner: ownerKeypair
+});
 ```
 
-#### `getAllUserFarmPositions(userPublicKey: string | PublicKey, rpcUrl?: string, targetLpMint?: string): Promise<FarmPosition[]>`
-Get all farm positions for a user, optionally filtered by LP mint.
+#### `removeLiquidity(connection: Connection, params: RemoveLiquidityParams): Promise<TransactionSignature>`
+Remove liquidity from a Raydium pool.
+
+#### `getUserLpBalance(connection: Connection, poolId: string, userPublicKey: PublicKey): Promise<BN>`
+Get user's LP token balance for a specific pool.
+
+#### `estimateRemoveLiquidity(lpAmount: BN, poolInfo: RaydiumPoolInfo): { amountA: BN, amountB: BN }`
+Estimate the amounts of tokens that will be received when removing liquidity.
+
+### Utility Functions
+
+#### `getRaydiumInstance(rpcUrl?: string): Promise<Raydium>`
+Get or create a Raydium SDK instance.
+
+#### `poolContainsSol(poolInfo: RaydiumPoolInfo): boolean`
+Check if a pool contains SOL.
+
+#### `clearPoolCache(): void`
+Clear the internal pool cache.
 
 ## Types
 
@@ -113,13 +143,36 @@ interface UserRaydiumPosition {
 }
 ```
 
-### FarmPosition
+### AddLiquidityParams
 ```typescript
-interface FarmPosition {
-  farmId: string;
-  lpMint: string;
-  deposited: string;
-  farmInfo: RaydiumFarm;
+interface AddLiquidityParams {
+  poolId: string;
+  amountA: number | BN;
+  amountB: number | BN;
+  slippage: number;
+  owner: Keypair;
+}
+```
+
+### RemoveLiquidityParams
+```typescript
+interface RemoveLiquidityParams {
+  poolId: string;
+  lpAmount: number | BN;
+  slippage: number;
+  owner: Keypair;
+}
+```
+
+## Plugin Structure
+
+```typescript
+const raydiumPlugin = {
+  name: "raydium",
+  description: "Raydium AMM plugin for Solana yield and pool info",
+  actions: [],    // No actions currently implemented
+  providers: [],  // No providers currently implemented
+  // Direct function exports...
 }
 ```
 
