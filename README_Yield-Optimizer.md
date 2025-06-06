@@ -24,10 +24,9 @@ This agent serves as an automated yield farming tool that:
 
 ## Environment Setup
 
-1. Clone the repository:
+1. Clone this repository:
 ```bash
-git clone <repository-url>
-cd elizaOS_yield-generator/eliza
+git clone https://github.com/chrissavov/elizaOS-yield_optimizer.git
 ```
 
 2. Install dependencies:
@@ -36,7 +35,7 @@ pnpm install
 ```
 
 3. Configure environment variables:
-Create a `.env` file in the root directory with the following:
+Copy the `.env.example` file to `.env` in the root directory and make sure to fill in the following:
 
 ```env
 # Solana Configuration
