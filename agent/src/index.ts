@@ -41,7 +41,7 @@ import { swapToken } from "@elizaos/plugin-solana";
 import { Keypair, Connection, VersionedTransaction, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import BN from "bn.js";
-import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserLpBalance, poolContainsSol, removeLiquidity, addLiquidity } from '@elizaos/plugin-raydium';
+import { getRaydiumPoolInfo, findRaydiumPoolAddressBySymbol, getMintsForSymbol, findRaydiumPoolByMints, getUserRaydiumPositions, getUserLpBalance, poolContainsSol, removeLiquidity, addLiquidity, clearPoolCache } from '@elizaos/plugin-raydium';
 
 // SPL Token Program ID
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -1091,7 +1091,6 @@ async function executeJupiterSwap(connection: Connection, walletKeypair: Keypair
     
     elizaLogger.info(`✅ Swap successful!`);
     elizaLogger.info(`🔗 Transaction: ${signature}`);
-    elizaLogger.info(`💰 Received: ${outputSol.toFixed(6)} SOL`);
     elizaLogger.info(`📊 SOL balance: ${beforeSOL.toFixed(6)} → ${afterSOL.toFixed(6)}`);
     
     await wait(2000, 3000);
@@ -1127,8 +1126,6 @@ async function swapHalfSOLToPoolToken(connection: Connection, walletKeypair: Key
         await executeJupiterSwap(connection, walletKeypair, SOL_MINT, otherTokenMint, amountToSwapLamports);
         
         await wait(3000, 5000);
-        const finalSolBalance = await connection.getBalance(walletKeypair.publicKey) / 1e9;
-        elizaLogger.info(`📊 Final SOL balance: ${finalSolBalance.toFixed(6)} SOL`);
         
         elizaLogger.info("✅ Swapped half SOL for pool token");
         return true;
@@ -1216,7 +1213,7 @@ async function addLiquidityToPool(
             elizaLogger.info(`   Fixed side: ${fixedSide}`);
             elizaLogger.info(`   Pool symbol: ${parsed.symbol}`);
             
-            const slippagePercent = 10;
+            const slippagePercent = 1;
             elizaLogger.info(`📊 Using ${slippagePercent}% slippage to handle price movements`);
             
             try {
@@ -1311,10 +1308,6 @@ function calculateLiquidityAmounts(
     const baseReserve = new BN(poolReserves.baseReserve);
     const quoteReserve = new BN(poolReserves.quoteReserve);
     
-    const poolPrice = quoteReserve.mul(new BN(10).pow(new BN(poolInfo.mintADecimals)))
-        .div(baseReserve.mul(new BN(10).pow(new BN(poolInfo.mintBDecimals))));
-    
-    elizaLogger.info(`📊 Pool price: ${poolPrice.toString()} (quote per base, normalized)`);
     elizaLogger.info(`📊 mintA: ${mintA}, mintB: ${mintB}, SOL_MINT: ${SOL_MINT}`);
     
     let baseAmount: string;
@@ -1330,11 +1323,7 @@ function calculateLiquidityAmounts(
         quoteAmount = maxQuoteAmount.toString();
         fixedSide = 'base';
         
-        const availableSol = (solBalance - MIN_SOL_BALANCE) * 1e9;
         elizaLogger.info(`📊 Using ${otherTokenBalance} tokens as base (fixed)`);
-        elizaLogger.info(`📊 Calculated required WSOL: ${requiredQuote.toNumber() / 1e9} SOL`);
-        elizaLogger.info(`📊 Max WSOL to provide (with buffer): ${maxQuoteAmount.toNumber() / 1e9} SOL`);
-        elizaLogger.info(`📊 Available SOL: ${availableSol / 1e9} SOL`);
     } else {
         baseAmount = otherTokenBalance;
         const requiredQuote = new BN(otherTokenBalance).mul(quoteReserve).div(baseReserve);
@@ -1343,11 +1332,7 @@ function calculateLiquidityAmounts(
         quoteAmount = maxQuoteAmount.toString();
         fixedSide = 'base';
         
-        const availableSol = (solBalance - MIN_SOL_BALANCE) * 1e9;
         elizaLogger.info(`📊 Using ${parsed.symbol.split('-')[0]} as base (fixed)`);
-        elizaLogger.info(`📊 Calculated required WSOL: ${requiredQuote.toNumber() / 1e9} SOL`);
-        elizaLogger.info(`📊 Max WSOL to provide (with buffer): ${maxQuoteAmount.toNumber() / 1e9} SOL`);
-        elizaLogger.info(`📊 Available SOL: ${availableSol / 1e9} SOL`);
     }
     
     return { baseAmount, quoteAmount, fixedSide };
@@ -1487,7 +1472,7 @@ async function executePoolSwitch(
             config.SOL_MINT
         );
         
-        // Step 4: Swap half SOL to pool token
+        // Step 4: Swap half SOL balance to pool token
         const swapSuccess = await swapHalfSOLToPoolToken(
             connection,
             walletKeypair,
@@ -1535,7 +1520,7 @@ async function startYieldOptimizerLoop(runtime: any) {
     
     // Configuration
     const config = {
-        scanIntervalMs: 5 * 60 * 1000, // 5 minutes
+        scanIntervalMs: 1 * 60 * 1000, // 5 minutes
         SOL_MINT: "So11111111111111111111111111111111111111112",
         walletPublicKey: settings.SOLANA_PUBLIC_KEY!,
         walletPrivateKey: settings.SOLANA_PRIVATE_KEY!,
@@ -1607,6 +1592,10 @@ async function startYieldOptimizerLoop(runtime: any) {
             } else {
                 elizaLogger.error(String(err));
             }
+        } finally {
+            // Clear the Raydium pool cache to free up memory
+            clearPoolCache();
+            elizaLogger.info("🧹 Cleared Raydium pool cache to free memory");
         }
         await wait(config.scanIntervalMs, config.scanIntervalMs + 1000);
     }

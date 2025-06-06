@@ -1,51 +1,6 @@
 import type { PublicKey } from '@solana/web3.js';
 
 /**
- * Interface representing a reward info for a farm
- */
-export interface FarmRewardInfo {
-  rewardMint: string;
-  rewardVault: string;
-  rewardOpenTime?: number;
-  rewardEndTime?: number;
-  rewardPerSecond?: number;
-  rewardSender?: string;
-  rewardType?: string;
-}
-
-/**
- * Interface representing a Raydium farm configuration
- */
-export interface RaydiumFarm {
-  id: string;
-  lpMint: string;
-  programId: string;
-  version: number;
-  symbol?: string;
-  baseMint?: string;
-  quoteMint?: string;
-  authority?: string;
-  lpVault?: string;
-  rewardInfos?: FarmRewardInfo[];
-  upcoming?: boolean;
-  rewardPeriodMax?: number;
-  rewardPeriodMin?: number;
-  rewardPeriodExtend?: number;
-  creator?: string;
-  [key: string]: any; // Allow additional properties from the API
-}
-
-/**
- * Interface representing a user's farm position
- */
-export interface FarmPosition {
-  farmId: string;
-  lpMint: string;
-  deposited: string;
-  farmInfo: RaydiumFarm;
-}
-
-/**
  * Interface representing Raydium pool information
  */
 export interface RaydiumPoolInfo {

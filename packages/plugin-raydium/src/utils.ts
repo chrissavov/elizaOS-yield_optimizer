@@ -111,31 +111,25 @@ export async function isRaydiumLpToken(mintAddress: string): Promise<RaydiumPool
   return poolMap.get(mintAddress) || null;
 }
 
-// Enhanced function to get all user positions (unstaked + farmed)
+// Enhanced function to get all user positions
 export async function getAllUserPositions(
   userPublicKey: string | PublicKey,
   rpcUrl: string
 ): Promise<{
   unstakedPositions: any[];
-  farmedPositions: any[];
   totalPositions: number;
 }> {
-  const { getUserRaydiumPositions, getAllUserFarmPositions } = await import('./index');
+  const { getUserRaydiumPositions } = await import('./index');
   
-  elizaLogger.info('Fetching all user positions (unstaked + farmed)...');
+  elizaLogger.info('Fetching all user positions (unstaked)...');
   
   // Get unstaked LP positions
   const unstakedPositions = await getUserRaydiumPositions(userPublicKey, rpcUrl);
   elizaLogger.info(`Found ${unstakedPositions.length} unstaked LP positions`);
   
-  // Get farmed positions
-  const farmedPositions = await getAllUserFarmPositions(userPublicKey, rpcUrl);
-  elizaLogger.info(`Found ${farmedPositions.length} farmed positions`);
-  
   return {
     unstakedPositions,
-    farmedPositions,
-    totalPositions: unstakedPositions.length + farmedPositions.length
+    totalPositions: unstakedPositions.length
   };
 }
 
@@ -149,4 +143,14 @@ const logger = {
 // Use simple logger if elizaLogger is not available
 if (!elizaLogger) {
   Object.assign(elizaLogger, logger);
+}
+
+// Function to clear the pool cache
+export function clearPoolCache() {
+  if (cachedPoolData) {
+    cachedPoolData.clear();
+    cachedPoolData = null;
+    lastPoolFetch = 0;
+    elizaLogger.info('Cleared Raydium pool cache');
+  }
 }
