@@ -233,176 +233,120 @@ export async function addLiquidity(
         elizaLogger.info(`📊 Slippage: ${params.slippage}%`);
         elizaLogger.info(`👤 Wallet: ${params.walletKeypair.publicKey.toString()}`);
         
-        // Execute transaction using the SDK's built-in method
-        try {
-            // Add delay to avoid rate limiting
-            elizaLogger.info('⏳ Waiting 10 seconds to avoid rate limiting...');
-            await new Promise(resolve => setTimeout(resolve, 10000));
-            
-            elizaLogger.info('🚀 Executing add liquidity transaction via SDK...');
-            
-            // The SDK expects the owner to be provided with the keypair
-            // Temporarily suppress console.log to avoid "simulate tx string" output
-            const originalLog = console.log;
-            console.log = () => {};
-            
-            let result: any;
-            try {
-                result = await addLiqTx.execute();
-            } finally {
-                // Restore console.log
-                console.log = originalLog;
-            }
-            
-            const txId = typeof result === 'string' ? result : result?.txId;
-            
-            elizaLogger.info(`✅ Add liquidity transaction successful!`);
-            elizaLogger.info(`🔗 Transaction ID: ${txId}`);
-            elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${txId}`);
-            elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${txId}`);
-            
-            return txId;
-        } catch (execError: any) {
-            // If execute fails, try manual signing and sending
-            elizaLogger.warn(`⚠️  SDK execution failed: ${execError.message}`);
-            
-            if (execError.message?.includes('429') || execError.message?.includes('Too Many Requests')) {
-                elizaLogger.warn('Rate limited, waiting 10 seconds before retry...');
-                await new Promise(resolve => setTimeout(resolve, 10000));
-            } else if (execError.message?.includes('Blockhash not found')) {
-                elizaLogger.warn('Blockhash expired during SDK execution, will try manual sending with fresh blockhash...');
-            }
-            
-            // Try manual transaction sending as fallback
-            elizaLogger.info('🔄 Falling back to manual transaction sending...');
-            if (addLiqTx.transaction) {
-                // Get fresh blockhash
-                elizaLogger.info('Fetching fresh blockhash...');
-                let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-                
-                const tx = addLiqTx.transaction;
-                
-                // Check if this is a VersionedTransaction (has 'message' property)
-                if ('message' in tx) {
-                    // This is a VersionedTransaction
-                    tx.message.recentBlockhash = blockhash;
-                    tx.sign([params.walletKeypair]);
-                } else {
-                    // This is a legacy Transaction
-                    (tx as any).recentBlockhash = blockhash;
-                    (tx as any).feePayer = params.walletKeypair.publicKey;
-                    (tx as any).sign(params.walletKeypair);
-                }
-                
-                // Add retry logic for rate limiting and blockhash issues
-                let retries = 3;
-                while (retries > 0) {
-                    try {
-                        elizaLogger.info(`📤 Sending transaction (attempt ${4 - retries}/3)...`);
-                        
-                        // First try to simulate to get better error messages
-                        try {
-                            elizaLogger.info('🔍 Simulating transaction first...');
-                            const simulation = await connection.simulateTransaction(
-                                addLiqTx.transaction as any,
-                                undefined,
-                                true // include accounts for better debugging
-                            );
-                            if (simulation.value.err) {
-                                elizaLogger.error('❌ Transaction simulation failed:', JSON.stringify(simulation.value.err));
-                                if (simulation.value.logs && simulation.value.logs.length > 0) {
-                                    elizaLogger.error('📋 Program logs:');
-                                    simulation.value.logs.forEach((log: string, index: number) => {
-                                        elizaLogger.error(`   ${index}: ${log}`);
-                                    });
-                                }
-                            } else {
-                                elizaLogger.info('✅ Transaction simulation succeeded');
-                            }
-                        } catch (simError: any) {
-                            elizaLogger.warn('⚠️  Simulation failed:', simError.message);
-                        }
-                        
-                        // Try sending the transaction
-                        const signature = await connection.sendRawTransaction(
-                            addLiqTx.transaction.serialize(),
-                            { 
-                                skipPreflight: false, // Don't skip preflight to see errors
-                                maxRetries: 3
-                            }
-                        );
-                        
-                        elizaLogger.info(`📋 Transaction sent with signature: ${signature}`);
-                        elizaLogger.info(`⏳ Waiting for confirmation...`);
-                        
-                        // Use polling-based confirmation to avoid WebSocket
-                        elizaLogger.info(`⏳ Confirming transaction...`);
-                        
-                        // Poll for transaction status instead of using WebSocket
-                        let confirmed = false;
-                        const maxAttempts = 30;
-                        for (let i = 0; i < maxAttempts; i++) {
-                            try {
-                                const status = await connection.getSignatureStatus(signature);
-                                if (status?.value?.confirmationStatus === 'confirmed' || 
-                                    status?.value?.confirmationStatus === 'finalized') {
-                                    confirmed = true;
-                                    break;
-                                }
-                            } catch (e) {
-                                // Ignore errors during polling
-                            }
-                            
-                            // Wait 1 second between polls
-                            await new Promise(resolve => setTimeout(resolve, 1000));
-                        }
-                        
-                        if (confirmed) {
-                            elizaLogger.info(`✅ Add liquidity transaction successful!`);
-                        } else {
-                            elizaLogger.warn(`⚠️  Transaction confirmation timeout, but transaction may still be successful`);
-                        }
-                        
-                        elizaLogger.info(`🔗 Transaction ID: ${signature}`);
-                        elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${signature}`);
-                        elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
-                        
-                        return signature;
-                        
-                    } catch (sendError: any) {
-                        elizaLogger.warn(`⚠️  Transaction send attempt ${4 - retries}/3 failed: ${sendError.message}`);
-                        
-                        if (sendError.message?.includes('429') && retries > 1) {
-                            elizaLogger.warn(`Rate limited, waiting before retry...`);
-                            await new Promise(resolve => setTimeout(resolve, 10000));
-                            retries--;
-                        } else if (sendError.message?.includes('Blockhash not found') && retries > 1) {
-                            elizaLogger.warn(`Blockhash expired, getting fresh blockhash and retrying...`);
-                            // Get a fresh blockhash for retry
-                            const freshBlockhash = await connection.getLatestBlockhash('confirmed');
-                            blockhash = freshBlockhash.blockhash;
-                            lastValidBlockHeight = freshBlockhash.lastValidBlockHeight;
-                            
-                            // Update transaction with fresh blockhash
-                            if ('message' in tx) {
-                                // This is a VersionedTransaction
-                                tx.message.recentBlockhash = blockhash;
-                                tx.sign([params.walletKeypair]);
-                            } else {
-                                // This is a legacy Transaction
-                                (tx as any).recentBlockhash = blockhash;
-                                (tx as any).sign(params.walletKeypair);
-                            }
-                            
-                            retries--;
-                        } else {
-                            throw sendError;
-                        }
-                    }
-                }
-            }
-            throw execError;
+        // Add delay to avoid rate limiting
+        elizaLogger.info('⏳ Waiting 10 seconds to avoid rate limiting...');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        
+        // Execute transaction using manual signing and sending
+        elizaLogger.info('🚀 Executing add liquidity transaction...');
+        
+        if (!addLiqTx.transaction) {
+            throw new Error('No transaction created');
         }
+        
+        // Manual transaction sending
+        // Get fresh blockhash
+        elizaLogger.info('Fetching fresh blockhash...');
+        let { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        
+        const tx = addLiqTx.transaction;
+        
+        // Check if this is a VersionedTransaction (has 'message' property)
+        if ('message' in tx) {
+            // This is a VersionedTransaction
+            tx.message.recentBlockhash = blockhash;
+            tx.sign([params.walletKeypair]);
+        } else {
+            // This is a legacy Transaction
+            (tx as any).recentBlockhash = blockhash;
+            (tx as any).feePayer = params.walletKeypair.publicKey;
+            (tx as any).sign(params.walletKeypair);
+        }
+        
+        // Add retry logic for rate limiting and blockhash issues
+        let retries = 3;
+        while (retries > 0) {
+            try {
+                elizaLogger.info(`📤 Sending transaction (attempt ${4 - retries}/3)...`);
+                
+                // Send the transaction directly without simulation
+                const signature = await connection.sendRawTransaction(
+                    addLiqTx.transaction.serialize(),
+                    { 
+                        skipPreflight: false, // Don't skip preflight to see errors
+                        maxRetries: 3
+                    }
+                );
+                
+                elizaLogger.info(`📋 Transaction sent with signature: ${signature}`);
+                elizaLogger.info(`⏳ Waiting for confirmation...`);
+                
+                // Use polling-based confirmation to avoid WebSocket
+                elizaLogger.info(`⏳ Confirming transaction...`);
+                
+                // Poll for transaction status instead of using WebSocket
+                let confirmed = false;
+                const maxAttempts = 30;
+                for (let i = 0; i < maxAttempts; i++) {
+                    try {
+                        const status = await connection.getSignatureStatus(signature);
+                        if (status?.value?.confirmationStatus === 'confirmed' || 
+                            status?.value?.confirmationStatus === 'finalized') {
+                            confirmed = true;
+                            break;
+                        }
+                    } catch (e) {
+                        // Ignore errors during polling
+                    }
+                    
+                    // Wait 1 second between polls
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                
+                if (confirmed) {
+                    elizaLogger.info(`✅ Add liquidity transaction successful!`);
+                } else {
+                    elizaLogger.warn(`⚠️  Transaction confirmation timeout, but transaction may still be successful`);
+                }
+                
+                elizaLogger.info(`🔗 Transaction ID: ${signature}`);
+                elizaLogger.info(`🌐 View on Solana Explorer: https://explorer.solana.com/tx/${signature}`);
+                elizaLogger.info(`🌐 View on Solscan: https://solscan.io/tx/${signature}`);
+                
+                return signature;
+                
+            } catch (sendError: any) {
+                elizaLogger.warn(`⚠️  Transaction send attempt ${4 - retries}/3 failed: ${sendError.message}`);
+                
+                if (sendError.message?.includes('429') && retries > 1) {
+                    elizaLogger.warn(`Rate limited, waiting before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, 10000));
+                    retries--;
+                } else if (sendError.message?.includes('Blockhash not found') && retries > 1) {
+                    elizaLogger.warn(`Blockhash expired, getting fresh blockhash and retrying...`);
+                    // Get a fresh blockhash for retry
+                    const freshBlockhash = await connection.getLatestBlockhash('confirmed');
+                    blockhash = freshBlockhash.blockhash;
+                    lastValidBlockHeight = freshBlockhash.lastValidBlockHeight;
+                    
+                    // Update transaction with fresh blockhash
+                    if ('message' in tx) {
+                        // This is a VersionedTransaction
+                        tx.message.recentBlockhash = blockhash;
+                        tx.sign([params.walletKeypair]);
+                    } else {
+                        // This is a legacy Transaction
+                        (tx as any).recentBlockhash = blockhash;
+                        (tx as any).sign(params.walletKeypair);
+                    }
+                    
+                    retries--;
+                } else {
+                    throw sendError;
+                }
+            }
+        }
+        throw new Error('Failed to send transaction after all retries');
 
     } catch (error) {
         elizaLogger.error('Error adding liquidity:', error);

@@ -207,7 +207,8 @@ export async function getUserRaydiumPositions(userPublicKey: string | PublicKey,
     }
   }
   
-  console.log(`[RaydiumPlugin] Found ${allLpTokens.size} total LP tokens, ${positions.length} with non-zero balance`);
+  const nonZeroLpTokens = positions.length; // Count only positions with balance
+  console.log(`[RaydiumPlugin] Found ${allLpTokens.size} total LP tokens, ${nonZeroLpTokens} with non-zero balance`);
   
   return positions;
 }
